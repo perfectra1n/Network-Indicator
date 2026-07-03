@@ -95,27 +95,54 @@ PluginComponent {
             return;  // Don't load or set dataLoaded — wait for pluginService to be injected
         }
 
-        var days = pluginService.loadPluginState(pluginId, "days", {});
-        var lastRx = pluginService.loadPluginState(pluginId, "lastRxBytes", -1);
-        var lastTx = pluginService.loadPluginState(pluginId, "lastTxBytes", -1);
-        var lastIface = pluginService.loadPluginState(pluginId, "lastInterface", "");
+        try {
+            var days = pluginService.loadPluginState(pluginId, "days", {});
+            var lastRx = pluginService.loadPluginState(pluginId, "lastRxBytes", -1);
+            var lastTx = pluginService.loadPluginState(pluginId, "lastTxBytes", -1);
+            var lastIface = pluginService.loadPluginState(pluginId, "lastInterface", "");
+            var lastNetwork = pluginService.loadPluginState(pluginId, "lastNetworkName", "");
 
-        var safeDays = {};
-        try { safeDays = JSON.parse(JSON.stringify(days || {})); }
-        catch (e) { safeDays = days || {}; }
-
-        // Migrate legacy data
-        var keys = Object.keys(safeDays);
-        for (var i = 0; i < keys.length; i++) {
-            var day = safeDays[keys[i]];
-            if (!day.networks) {
-                day.networks = { "unknown": { rx: day.rx || 0, tx: day.tx || 0 } };
+            var safeDays = {};
+            try { safeDays = JSON.parse(JSON.stringify(days || {})); }
+            catch (e) { safeDays = days || {}; }
+            // A hand-edited (or future-version) state file may hold wrong types
+            if (typeof safeDays !== "object" || Array.isArray(safeDays) || safeDays === null) {
+                safeDays = {};
             }
+
+            // Migrate legacy data and coerce numeric fields (bad types would
+            // otherwise poison the accumulated totals with NaN)
+            var keys = Object.keys(safeDays);
+            for (var i = 0; i < keys.length; i++) {
+                var day = safeDays[keys[i]];
+                if (!day || typeof day !== "object" || Array.isArray(day)) {
+                    delete safeDays[keys[i]];
+                    continue;
+                }
+                day.rx = Number(day.rx) || 0;
+                day.tx = Number(day.tx) || 0;
+                if (!day.networks || typeof day.networks !== "object" || Array.isArray(day.networks)) {
+                    day.networks = { "unknown": { rx: day.rx, tx: day.tx } };
+                }
+                var nKeys = Object.keys(day.networks);
+                for (var j = 0; j < nKeys.length; j++) {
+                    var net = day.networks[nKeys[j]];
+                    if (!net || typeof net !== "object") {
+                        day.networks[nKeys[j]] = { rx: 0, tx: 0 };
+                        continue;
+                    }
+                    net.rx = Number(net.rx) || 0;
+                    net.tx = Number(net.tx) || 0;
+                }
+            }
+
+            usageData = { lastRxBytes: lastRx, lastTxBytes: lastTx, lastInterface: lastIface, lastNetworkName: lastNetwork, days: safeDays };
+        } catch (e) {
+            console.warn("NetworkIndicator: failed to load usage data, starting fresh:", e);
+            usageData = { lastRxBytes: -1, lastTxBytes: -1, lastInterface: "", lastNetworkName: "", days: {} };
         }
-
-        var lastNetwork = pluginService.loadPluginState(pluginId, "lastNetworkName", "");
-
-        usageData = { lastRxBytes: lastRx, lastTxBytes: lastTx, lastInterface: lastIface, lastNetworkName: lastNetwork, days: safeDays };
+        // Fall through even on failure: dataLoaded must become true or the
+        // poll/save timers never start and the widget stays dead
 
 
         todayKey = getCurrentDateKey();
