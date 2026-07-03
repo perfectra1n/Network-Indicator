@@ -55,4 +55,14 @@ PluginSettings {
         ]
         defaultValue: "separate"
     }
+
+    ListSettingWithInput {
+        settingKey: "trackedInterfaces"
+        label: "Tracked Interfaces"
+        description: "Only consider these interfaces when tracking (the first active one is used). Leave empty to pick the active interface automatically. Use names exactly as they appear in /sys/class/net, e.g. \"wlan0\" or \"enp3s0\"."
+        fields: [
+            { id: "name", placeholder: "e.g. wlan0", required: true, width: 200 }
+        ]
+        defaultValue: []
+    }
 }

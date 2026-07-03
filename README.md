@@ -51,6 +51,7 @@ dms restart
 | **Update Interval** | Polling frequency in seconds (e.g., `1` to `10`) | 2 sec |
 | **Display Unit** | Auto / KB/s / MB/s | Auto |
 | **Display Mode** | **Separate** (show ↑ and ↓) or **Combined** (single total speed) | Separate |
+| **Tracked Interfaces** | Restrict tracking to specific interfaces (first active one is used); empty means automatic | Automatic |
 
 ## 🛠️ How It Works
 
@@ -63,7 +64,7 @@ The plugin reads Linux's built-in network statistics.
 | WiFi network name | `iwgetid` (or `nmcli` fallback), optional | Names per-network usage buckets; falls back to the interface name if neither is available |
 | Persistence | DMS Plugin State API | Saves daily usage across reboots (30-day rolling window) |
 
-It automatically finds your active network interface, ignoring loopback and virtual interfaces (docker, veth, etc.).
+It automatically finds your active network interface, ignoring loopback and virtual interfaces (docker, veth, etc.). If you want to pin tracking to specific interfaces instead — say, ignore a VPN tunnel or watch only ethernet — list them under **Tracked Interfaces** in the plugin settings; explicitly listed interfaces are honored even if they would normally be skipped as virtual.
 
 ## 📄 License
 

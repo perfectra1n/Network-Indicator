@@ -18,6 +18,21 @@ PluginComponent {
     property string displayUnit: pluginData.displayUnit || "auto"
     // "separate" = show ↑ and ↓ individually, "combined" = single total speed
     property string displayMode: pluginData.displayMode || "separate"
+    // Interfaces the user chose to track; empty = pick the active one automatically
+    property var trackedInterfaces: pluginData.trackedInterfaces || []
+
+    // Normalized interface names from the setting (accepts both plain strings
+    // and the { name: ... } objects ListSettingWithInput stores)
+    readonly property var _trackedIfaceNames: {
+        var names = [];
+        var list = trackedInterfaces || [];
+        for (var i = 0; i < list.length; i++) {
+            var n = (typeof list[i] === "string") ? list[i] : ((list[i] && list[i].name) || "");
+            n = String(n).trim();
+            if (n && names.indexOf(n) === -1) names.push(n);
+        }
+        return names;
+    }
 
     // ── Internal state ──
     property real downloadSpeed: 0
@@ -435,10 +450,16 @@ PluginComponent {
                 var parts = trimmed.split(":");
                 var ifaceName = parts[0].trim();
 
-                // Skip loopback and virtual interfaces, use first real interface
-                if (ifaceName === "lo") return;
-                if (ifaceName.startsWith("docker") || ifaceName.startsWith("br-") ||
-                    ifaceName.startsWith("veth") || ifaceName.startsWith("virbr")) return;
+                if (root._trackedIfaceNames.length > 0) {
+                    // Explicit selection: only listed interfaces are eligible
+                    // (an explicit entry may be virtual or loopback on purpose)
+                    if (root._trackedIfaceNames.indexOf(ifaceName) === -1) return;
+                } else {
+                    // Automatic: skip loopback and virtual interfaces, use first real interface
+                    if (ifaceName === "lo") return;
+                    if (ifaceName.startsWith("docker") || ifaceName.startsWith("br-") ||
+                        ifaceName.startsWith("veth") || ifaceName.startsWith("virbr")) return;
+                }
 
                 // Skip interfaces known to be down so a dead first interface
                 // (e.g. unplugged ethernet) can't mask a working later one
