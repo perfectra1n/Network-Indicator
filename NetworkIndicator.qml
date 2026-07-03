@@ -29,6 +29,8 @@ PluginComponent {
     property bool _foundThisCycle: false // per-cycle temp flag (never triggers re-render)
     property string _activeIfaceThisCycle: "" // interface name found this cycle
     property string _activeSsidThisCycle: ""  // ssid found this cycle
+    property var _upIfaces: ({})         // per-cycle operstate lookup (iface → bool)
+    property var _ssidByIface: ({})      // per-cycle SSID lookup (iface → ssid)
     property bool _lastPollFailed: false // last poll script exit status (for log throttling)
 
     // ── Persistent data usage tracking ──
@@ -345,6 +347,8 @@ PluginComponent {
             root._foundThisCycle = false;
             root._activeIfaceThisCycle = "";
             root._activeSsidThisCycle = "";
+            root._upIfaces = {};
+            root._ssidByIface = {};
             root._tempDeltaRx = 0;
             root._tempDeltaTx = 0;
             netProcess.running = true;
@@ -369,7 +373,8 @@ PluginComponent {
         id: netProcess
         command: [
             "sh", "-c",
-            "cat /proc/net/dev; " +
+            // OPSTATE/SSID lines must be emitted BEFORE /proc/net/dev so the
+            // parser can skip down interfaces when picking one (see stdout below)
             "for f in /sys/class/net/*/operstate; do " +
             "  iface=$(basename $(dirname $f)); " +
             "  echo \"OPSTATE:${iface}:$(cat $f 2>/dev/null)\"; " +
@@ -380,29 +385,26 @@ PluginComponent {
             "    fi; " +
             "    echo \"SSID:${iface}:${ssid}\"; " +
             "  fi; " +
-            "done"
+            "done; " +
+            "cat /proc/net/dev"
         ]
         stdout: SplitParser {
             onRead: line => {
+                // SSID/OPSTATE lines arrive before the /proc/net/dev output;
+                // collect them into per-cycle lookup maps used at selection time
                 if (line.startsWith("SSID:")) {
                     var sparts = line.split(":");
-                    var sIface = sparts[1];
-                    var sSsid = sparts.slice(2).join(":").trim(); // Handle SSIDs with colons
-                    if (sIface === root._activeIfaceThisCycle) {
-                        root._activeSsidThisCycle = sSsid;
-                    }
+                    // slice(2) handles SSIDs containing colons; keep "" so the
+                    // display falls back to the interface name (see onExited)
+                    root._ssidByIface[sparts[1]] = sparts.slice(2).join(":").trim();
                     return;
                 }
 
-                // Handle operstate lines — they come after the /proc/net/dev output
                 if (line.startsWith("OPSTATE:")) {
                     var oparts = line.split(":");
-                    var oIface = oparts[1];
-                    var oState = oparts[2];
-                    // If this is the interface we picked this cycle, mark offline when down
-                    if (oIface === root._activeIfaceThisCycle && oState === "down") {
-                        root._foundThisCycle = false;
-                    }
+                    // Only "down" disqualifies — some drivers report "unknown"
+                    // while passing traffic
+                    root._upIfaces[oparts[1]] = (oparts[2] !== "down");
                     return;
                 }
 
@@ -421,10 +423,14 @@ PluginComponent {
                 if (ifaceName.startsWith("docker") || ifaceName.startsWith("br-") ||
                     ifaceName.startsWith("veth") || ifaceName.startsWith("virbr")) return;
 
+                // Skip interfaces known to be down so a dead first interface
+                // (e.g. unplugged ethernet) can't mask a working later one
+                if (root._upIfaces[ifaceName] === false) return;
+
                 // Lock in this interface for the cycle
                 root._foundThisCycle = true;
                 root._activeIfaceThisCycle = ifaceName;
-                root._activeSsidThisCycle = ""; // Reset until SSID line overrides
+                root._activeSsidThisCycle = root._ssidByIface[ifaceName] || "";
 
                 var stats = parts[1].trim().split(/\s+/);
                 // columns: rx_bytes rx_packets ... (8 rx fields) tx_bytes tx_packets ...
