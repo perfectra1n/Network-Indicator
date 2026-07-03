@@ -12,7 +12,7 @@ A real-time network speed and data usage monitor plugin for [DankMaterialShell](
 - 🔌 **Automatic offline detection** — shows when your connection drops
 - ↕️ **Works in horizontal and vertical bars**
 - ⚙️ **Configurable** — combined or separate speed readouts, adjustable units & polling rate
-- 🪶 **Zero dependencies** — pure Linux, no extra packages needed
+- 🪶 **Minimal dependencies** — uses Linux built-ins; optional `iwgetid`/`nmcli` for per-WiFi-network naming
 
 ## 📦 Installation
 
@@ -54,12 +54,13 @@ dms restart
 
 ## 🛠️ How It Works
 
-The plugin reads Linux's built-in network statistics — no external tools required.
+The plugin reads Linux's built-in network statistics.
 
 | What | Source | Purpose |
 |------|--------|---------|
 | Byte counters | `/proc/net/dev` | Calculates upload/download speed deltas each poll |
 | Link state | `/sys/class/net/*/operstate` | Detects online/offline instantly |
+| WiFi network name | `iwgetid` (or `nmcli` fallback), optional | Names per-network usage buckets; falls back to the interface name if neither is available |
 | Persistence | DMS Plugin State API | Saves daily usage across reboots (30-day rolling window) |
 
 It automatically finds your active network interface, ignoring loopback and virtual interfaces (docker, veth, etc.).
