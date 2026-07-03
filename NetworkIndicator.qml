@@ -136,22 +136,27 @@ PluginComponent {
 
     // ── Persistence: save via DMS Plugin State API (auto-debounced 150ms) ──
     function saveUsageData() {
-        if (!dataLoaded) return;
+        if (!dataLoaded || !pluginService) return;
 
-        root.unsavedBytes = 0;
-        usageData.days[todayKey] = { rx: todayRx, tx: todayTx, networks: todayNetworks };
-        usageData.lastRxBytes = prevRxBytes;
-        usageData.lastTxBytes = prevTxBytes;
-        usageData.lastInterface = _activeIfaceThisCycle || usageData.lastInterface || "";
-        usageData.lastNetworkName = currentNetworkName || usageData.lastNetworkName || "";
-        pruneOldDays();
+        try {
+            usageData.days[todayKey] = { rx: todayRx, tx: todayTx, networks: todayNetworks };
+            usageData.lastRxBytes = prevRxBytes;
+            usageData.lastTxBytes = prevTxBytes;
+            usageData.lastInterface = _activeIfaceThisCycle || usageData.lastInterface || "";
+            usageData.lastNetworkName = currentNetworkName || usageData.lastNetworkName || "";
+            pruneOldDays();
 
-        if (pluginService) {
             pluginService.savePluginState(pluginId, "days", usageData.days);
             pluginService.savePluginState(pluginId, "lastRxBytes", usageData.lastRxBytes);
             pluginService.savePluginState(pluginId, "lastTxBytes", usageData.lastTxBytes);
             pluginService.savePluginState(pluginId, "lastInterface", usageData.lastInterface);
             pluginService.savePluginState(pluginId, "lastNetworkName", usageData.lastNetworkName);
+
+            // Only clear once the state was handed to DMS — clearing earlier would
+            // silently drop the accumulated bytes if anything above throws
+            root.unsavedBytes = 0;
+        } catch (e) {
+            console.warn("NetworkIndicator: failed to save usage data:", e);
         }
     }
 
