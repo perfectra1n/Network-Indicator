@@ -388,7 +388,7 @@ PluginComponent {
                     var sIface = sparts[1];
                     var sSsid = sparts.slice(2).join(":").trim(); // Handle SSIDs with colons
                     if (sIface === root._activeIfaceThisCycle) {
-                        root._activeSsidThisCycle = sSsid || "unknown";
+                        root._activeSsidThisCycle = sSsid;
                     }
                     return;
                 }
