@@ -31,6 +31,7 @@ PluginComponent {
     property string _activeSsidThisCycle: ""  // ssid found this cycle
     property var _upIfaces: ({})         // per-cycle operstate lookup (iface → bool)
     property var _ssidByIface: ({})      // per-cycle SSID lookup (iface → ssid)
+    property string _lastPolledIface: "" // interface the previous delta was computed on
     property bool _lastPollFailed: false // last poll script exit status (for log throttling)
 
     // ── Persistent data usage tracking ──
@@ -431,6 +432,16 @@ PluginComponent {
                 root._foundThisCycle = true;
                 root._activeIfaceThisCycle = ifaceName;
                 root._activeSsidThisCycle = root._ssidByIface[ifaceName] || "";
+
+                // Counters from a different NIC are incomparable — drop one
+                // sample instead of booking the difference as usage (can be
+                // many GB when switching e.g. ethernet → wifi)
+                if (!root.firstPollAfterLoad && root._lastPolledIface !== "" &&
+                    ifaceName !== root._lastPolledIface) {
+                    root.prevRxBytes = -1;
+                    root.prevTxBytes = -1;
+                }
+                root._lastPolledIface = ifaceName;
 
                 var stats = parts[1].trim().split(/\s+/);
                 // columns: rx_bytes rx_packets ... (8 rx fields) tx_bytes tx_packets ...
