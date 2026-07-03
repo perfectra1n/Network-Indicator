@@ -50,6 +50,14 @@ PluginComponent {
     property real _tempDeltaTx: 0       // temp storage for current cycle
     property real unsavedBytes: 0       // bytes accumulated since last disk write
 
+    // ── Tuning constants ──
+    readonly property int saveIntervalMs: 7 * 60 * 1000          // periodic flush cadence
+    readonly property real flushThresholdBytes: 50 * 1024 * 1024 // save early once this much is unsaved
+    readonly property int historyRetentionDays: 30               // days of usage history kept
+    readonly property int collapsedPopoutHeight: 220             // popout height with history collapsed
+    readonly property int offlinePopoutHeight: 250               // collapsed height incl. offline banner
+    readonly property int maxPopoutHeight: 600                   // cap when history is expanded
+
     // ── Offline reason detection (uses DMS NetworkService) ──
     property bool _dmsNetworkAvailable: typeof DMSNetworkService !== "undefined" && DMSNetworkService.networkAvailable
     property string offlineReason: {
@@ -194,7 +202,7 @@ PluginComponent {
     // ── Prune entries older than 30 days ──
     function pruneOldDays() {
         var cutoff = new Date();
-        cutoff.setDate(cutoff.getDate() - 30);
+        cutoff.setDate(cutoff.getDate() - historyRetentionDays);
         var cutoffStr = Qt.formatDate(cutoff, "yyyy-MM-dd");
 
         var keys = Object.keys(usageData.days);
@@ -295,7 +303,7 @@ PluginComponent {
     // ── Update Popout Height dynamically ──
     function updatePopoutHeight() {
         if (!root.historyExpanded) {
-            root.popoutHeight = root.interfaceFound ? 220 : 250;
+            root.popoutHeight = root.interfaceFound ? root.collapsedPopoutHeight : root.offlinePopoutHeight;
         } else {
             root._maxDailyUsage = root.getMaxDailyUsage();
             
@@ -312,10 +320,10 @@ PluginComponent {
             // (Theme.spacingS evaluates to exactly 8px in DankMaterialShell)
             var historyH = nonListH + listContentH + Theme.spacingS;
             
-            // 232 is collapsedHeight (220) + historySection.topMargin (12).
-            // Without the 12px offset, historySection is 12px shorter than historyH, 
+            // collapsedPopoutHeight + historySection.topMargin (12).
+            // Without the 12px offset, historySection is 12px shorter than historyH,
             // causing the DankListView to clip its bottom entry and show a scrollbar!
-            root.popoutHeight = Math.min(232 + historyH, 600);
+            root.popoutHeight = Math.min(root.collapsedPopoutHeight + 12 + historyH, root.maxPopoutHeight);
         }
     }
 
@@ -359,7 +367,7 @@ PluginComponent {
     // ── Timer to periodically save to disk (every 7 mins) ──
     Timer {
         id: saveTimer
-        interval: 420000
+        interval: root.saveIntervalMs
         running: root.dataLoaded
         repeat: true
         onTriggered: {
@@ -550,7 +558,7 @@ PluginComponent {
 
                 root.unsavedBytes += (root._tempDeltaRx + root._tempDeltaTx);
 
-                if (root.unsavedBytes >= 50 * 1024 * 1024) {
+                if (root.unsavedBytes >= root.flushThresholdBytes) {
                     root.saveUsageData();
                 }
             }
@@ -789,7 +797,7 @@ PluginComponent {
             onVisibleChanged: {
                 if (visible) {
                     root.historyExpanded = false;
-                    root.popoutHeight = root.interfaceFound ? 220 : 250;
+                    root.popoutHeight = root.interfaceFound ? root.collapsedPopoutHeight : root.offlinePopoutHeight;
                 } else {
                     root.selectedNetworkFilter = "All";
                 }
@@ -1313,7 +1321,7 @@ PluginComponent {
     }
 
     popoutWidth: 325
-    popoutHeight: 220
+    popoutHeight: collapsedPopoutHeight
 
     Behavior on popoutHeight {
         NumberAnimation { duration: 150; easing.type: Easing.OutCubic }
