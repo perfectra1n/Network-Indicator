@@ -29,6 +29,7 @@ PluginComponent {
     property bool _foundThisCycle: false // per-cycle temp flag (never triggers re-render)
     property string _activeIfaceThisCycle: "" // interface name found this cycle
     property string _activeSsidThisCycle: ""  // ssid found this cycle
+    property bool _lastPollFailed: false // last poll script exit status (for log throttling)
 
     // ── Persistent data usage tracking ──
     property var usageData: ({})        // full parsed JSON object
@@ -371,7 +372,7 @@ PluginComponent {
             "cat /proc/net/dev; " +
             "for f in /sys/class/net/*/operstate; do " +
             "  iface=$(basename $(dirname $f)); " +
-            "  echo \"OPSTATE:${iface}:$(cat $f)\"; " +
+            "  echo \"OPSTATE:${iface}:$(cat $f 2>/dev/null)\"; " +
             "  if [ -d /sys/class/net/${iface}/wireless ]; then " +
             "    ssid=$(iwgetid -r ${iface} 2>/dev/null); " +
             "    if [ -z \"$ssid\" ] && command -v nmcli >/dev/null 2>&1; then " +
@@ -479,7 +480,16 @@ PluginComponent {
                 // Wait for exit to save so we have the SSID
             }
         }
+        stderr: SplitParser {
+            onRead: line => console.warn("NetworkIndicator: poll stderr:", line)
+        }
         onExited: exitCode => {
+            // Warn once per failure streak — this fires every updateInterval
+            if (exitCode !== 0 && !root._lastPollFailed) {
+                console.warn("NetworkIndicator: poll script exited with code", exitCode);
+            }
+            root._lastPollFailed = (exitCode !== 0);
+
             // Update interfaceFound ONLY after the full read completes (no flicker)
             root.interfaceFound = root._foundThisCycle;
 
