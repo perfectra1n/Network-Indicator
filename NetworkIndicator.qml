@@ -235,9 +235,17 @@ PluginComponent {
         if (!usageData || !usageData.days) return [];
         var entries = [];
         var keys = Object.keys(usageData.days);
+        // usageData.days[todayKey] only refreshes on save (every 7 min), so
+        // overlay the live counters for today. Reading todayRx/todayTx here
+        // also makes bindings through this function re-evaluate every poll.
+        if (todayKey && keys.indexOf(todayKey) === -1) {
+            keys.push(todayKey);
+        }
         keys.sort().reverse();
         for (var i = 0; i < keys.length; i++) {
-            var day = usageData.days[keys[i]];
+            var day = keys[i] === todayKey
+                ? { rx: todayRx, tx: todayTx, networks: todayNetworks }
+                : usageData.days[keys[i]];
             var r = 0;
             var t = 0;
             if (selectedNetworkFilter === "All") {
