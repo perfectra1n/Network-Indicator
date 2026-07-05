@@ -18,8 +18,13 @@ PluginComponent {
     property string displayUnit: pluginData.displayUnit || "auto"
     // "separate" = show ↑ and ↓ individually, "combined" = single total speed
     property string displayMode: pluginData.displayMode || "separate"
-    // Interfaces the user chose to track; empty = pick the active one automatically
+    // Interfaces the user chose to track; empty = track all real interfaces
     property var trackedInterfaces: pluginData.trackedInterfaces || []
+    // Ordered regex groups ({ name, pattern }); an interface counts toward the
+    // first group whose pattern matches, else the implicit "Other" bucket
+    property var interfaceGroups: pluginData.interfaceGroups || []
+    // Whether the per-app (nethogs) monitor is enabled
+    property bool perAppTraffic: pluginData.perAppTraffic || false
 
     // Normalized interface names from the setting (accepts both plain strings
     // and the { name: ... } objects ListSettingWithInput stores)
@@ -34,35 +39,79 @@ PluginComponent {
         return names;
     }
 
+    // Compiled group patterns; anchored full-match, invalid regex degrades to
+    // literal name equality (re: null) so a typo can't take the widget down
+    readonly property var _compiledGroups: {
+        var groups = [];
+        var list = interfaceGroups || [];
+        for (var i = 0; i < list.length; i++) {
+            var name = String((list[i] && list[i].name) || "").trim();
+            var pattern = String((list[i] && list[i].pattern) || "").trim();
+            if (!name || !pattern) continue;
+            var re = null;
+            try { re = new RegExp("^(?:" + pattern + ")$"); }
+            catch (e) {
+                console.warn("NetworkIndicator: invalid group pattern \"" + pattern + "\", matching it literally");
+            }
+            groups.push({ name: name, pattern: pattern, re: re });
+        }
+        return groups;
+    }
+
+    function groupForIface(iface) {
+        for (var i = 0; i < _compiledGroups.length; i++) {
+            var g = _compiledGroups[i];
+            if (g.re ? g.re.test(iface) : g.pattern === iface) return g.name;
+        }
+        return "Other";
+    }
+
+    // React to settings edits while the widget is running (the dataLoaded
+    // guard skips the spurious fire during component construction)
+    onInterfaceGroupsChanged: {
+        if (!dataLoaded) return;
+        syncGroupsModel();
+        if (historyExpanded) {
+            refreshNetworksModel();
+            refreshHistoryModel();
+        }
+        updatePopoutHeight();
+    }
+    onPerAppTrafficChanged: {
+        if (!dataLoaded) return;
+        updatePopoutHeight();
+    }
+    // Going offline swaps the popout base height and hides the group rows;
+    // coming back does the reverse — both need a height recompute
+    onInterfaceFoundChanged: {
+        if (!dataLoaded) return;
+        updatePopoutHeight();
+    }
+
     // ── Internal state ──
     property real downloadSpeed: 0
     property real uploadSpeed: 0
     property real totalSpeed: downloadSpeed + uploadSpeed
-    property real prevRxBytes: -1   // -1 = uninitialized sentinel
-    property real prevTxBytes: -1
+    property var prevCounters: ({})      // iface → {rx, tx} raw counters from the previous poll
     property bool interfaceFound: true  // assume online until first poll completes
-    property bool _foundThisCycle: false // per-cycle temp flag (never triggers re-render)
-    property string _activeIfaceThisCycle: "" // interface name found this cycle
-    property string _activeSsidThisCycle: ""  // ssid found this cycle
+    property var _cycleCounters: ({})    // per-cycle raw counters (iface → {rx, tx})
     property var _upIfaces: ({})         // per-cycle operstate lookup (iface → bool)
     property var _ssidByIface: ({})      // per-cycle SSID lookup (iface → ssid)
-    property string _lastPolledIface: "" // interface the previous delta was computed on
     property bool _lastPollFailed: false // last poll script exit status (for log throttling)
 
     // ── Persistent data usage tracking ──
     property var usageData: ({})        // full parsed JSON object
     property real todayRx: 0            // today's accumulated download bytes
     property real todayTx: 0            // today's accumulated upload bytes
-    property var todayNetworks: ({})    // today's usage per network
-    property string currentNetworkName: "" // resolved network name (SSID or iface)
+    property var todayNetworks: ({})    // today's usage per network (SSID or iface name)
+    property var todayInterfaces: ({})  // today's usage per interface
     property string todayKey: ""        // "yyyy-MM-dd" for current day
     property bool dataLoaded: false     // whether initial JSON was loaded
-    property bool firstPollAfterLoad: true // first poll needs special delta handling
+    property double _lastPollMs: 0      // wall time of the last counter read (real elapsed for speed)
     property bool historyExpanded: false // whether 30-day history panel is shown
     property real _maxDailyUsage: 1      // cached max for bar proportions (avoid O(n²))
-    property string selectedNetworkFilter: "All" // active filter for history
-    property real _tempDeltaRx: 0       // temp storage for current cycle
-    property real _tempDeltaTx: 0       // temp storage for current cycle
+    property string selectedFilterType: "all"  // "all" | "group" | "network"
+    property string selectedFilterName: "All"  // active history filter chip
     property real unsavedBytes: 0       // bytes accumulated since last disk write
 
     // ── Tuning constants ──
@@ -71,7 +120,9 @@ PluginComponent {
     readonly property int historyRetentionDays: 30               // days of usage history kept
     readonly property int collapsedPopoutHeight: 220             // popout height with history collapsed
     readonly property int offlinePopoutHeight: 250               // collapsed height incl. offline banner
-    readonly property int maxPopoutHeight: 600                   // cap when history is expanded
+    readonly property int maxPopoutHeight: 680                   // cap when history is expanded
+    readonly property int groupRowHeight: 28                     // height of one per-group usage row
+    property real _perAppSectionH: 0                             // reported by the popout's PerAppSection
 
     // ── Offline reason detection (uses DMS NetworkService) ──
     property bool _dmsNetworkAvailable: typeof DMSNetworkService !== "undefined" && DMSNetworkService.networkAvailable
@@ -124,10 +175,11 @@ PluginComponent {
 
         try {
             var days = pluginService.loadPluginState(pluginId, "days", {});
+            var lastCounters = pluginService.loadPluginState(pluginId, "lastCounters", {});
+            // Legacy single-interface keys (pre-1.5) — only used to seed lastCounters
             var lastRx = pluginService.loadPluginState(pluginId, "lastRxBytes", -1);
             var lastTx = pluginService.loadPluginState(pluginId, "lastTxBytes", -1);
             var lastIface = pluginService.loadPluginState(pluginId, "lastInterface", "");
-            var lastNetwork = pluginService.loadPluginState(pluginId, "lastNetworkName", "");
 
             var safeDays = {};
             try { safeDays = JSON.parse(JSON.stringify(days || {})); }
@@ -161,12 +213,48 @@ PluginComponent {
                     net.rx = Number(net.rx) || 0;
                     net.tx = Number(net.tx) || 0;
                 }
+                // Pre-1.5 days have no per-interface split; group-filtered
+                // views simply skip them rather than guessing an attribution
+                if (!day.interfaces || typeof day.interfaces !== "object" || Array.isArray(day.interfaces)) {
+                    day.interfaces = {};
+                }
+                var iKeys = Object.keys(day.interfaces);
+                for (var k = 0; k < iKeys.length; k++) {
+                    var ifc = day.interfaces[iKeys[k]];
+                    if (!ifc || typeof ifc !== "object") {
+                        day.interfaces[iKeys[k]] = { rx: 0, tx: 0 };
+                        continue;
+                    }
+                    ifc.rx = Number(ifc.rx) || 0;
+                    ifc.tx = Number(ifc.tx) || 0;
+                }
             }
 
-            usageData = { lastRxBytes: lastRx, lastTxBytes: lastTx, lastInterface: lastIface, lastNetworkName: lastNetwork, days: safeDays };
+            // Sanitize the per-interface counter baselines the same way
+            var safeCounters = {};
+            if (lastCounters && typeof lastCounters === "object" && !Array.isArray(lastCounters)) {
+                var cKeys = Object.keys(lastCounters);
+                for (var c = 0; c < cKeys.length; c++) {
+                    var entry = lastCounters[cKeys[c]];
+                    if (!entry || typeof entry !== "object") continue;
+                    var cr = Number(entry.rx);
+                    var ct = Number(entry.tx);
+                    if (isFinite(cr) && isFinite(ct) && cr >= 0 && ct >= 0) {
+                        safeCounters[cKeys[c]] = { rx: cr, tx: ct };
+                    }
+                }
+            }
+            // Migrate pre-1.5 state: seed the per-interface map from the old
+            // single-interface counter keys so the offline gap is still recovered
+            if (Object.keys(safeCounters).length === 0 &&
+                Number(lastRx) >= 0 && Number(lastTx) >= 0 && lastIface) {
+                safeCounters[lastIface] = { rx: Number(lastRx), tx: Number(lastTx) };
+            }
+
+            usageData = { lastCounters: safeCounters, days: safeDays };
         } catch (e) {
             console.warn("NetworkIndicator: failed to load usage data, starting fresh:", e);
-            usageData = { lastRxBytes: -1, lastTxBytes: -1, lastInterface: "", lastNetworkName: "", days: {} };
+            usageData = { lastCounters: {}, days: {} };
         }
         // Fall through even on failure: dataLoaded must become true or the
         // poll/save timers never start and the widget stays dead
@@ -178,14 +266,15 @@ PluginComponent {
             todayTx = usageData.days[todayKey].tx || 0;
             // deep copy to avoid modifying the read-only proxy in some Qt versions
             todayNetworks = JSON.parse(JSON.stringify(usageData.days[todayKey].networks || {}));
+            todayInterfaces = JSON.parse(JSON.stringify(usageData.days[todayKey].interfaces || {}));
         } else {
             todayRx = 0;
             todayTx = 0;
             todayNetworks = {};
+            todayInterfaces = {};
         }
 
         dataLoaded = true;
-        firstPollAfterLoad = true;
     }
 
     // ── Persistence: save via DMS Plugin State API (auto-debounced 150ms) ──
@@ -193,18 +282,29 @@ PluginComponent {
         if (!dataLoaded || !pluginService) return;
 
         try {
-            usageData.days[todayKey] = { rx: todayRx, tx: todayTx, networks: todayNetworks };
-            usageData.lastRxBytes = prevRxBytes;
-            usageData.lastTxBytes = prevTxBytes;
-            usageData.lastInterface = _activeIfaceThisCycle || usageData.lastInterface || "";
-            usageData.lastNetworkName = currentNetworkName || usageData.lastNetworkName || "";
+            usageData.days[todayKey] = { rx: todayRx, tx: todayTx, networks: todayNetworks, interfaces: todayInterfaces };
+            // Merge live baselines over the saved ones: interfaces not seen
+            // since load keep their saved baseline so their offline gap can
+            // still be recovered whenever they next appear
+            var mergedCounters = {};
+            var savedKeys = Object.keys(usageData.lastCounters || {});
+            for (var s = 0; s < savedKeys.length; s++) {
+                mergedCounters[savedKeys[s]] = usageData.lastCounters[savedKeys[s]];
+            }
+            var liveKeys = Object.keys(prevCounters);
+            for (var l = 0; l < liveKeys.length; l++) {
+                mergedCounters[liveKeys[l]] = { rx: prevCounters[liveKeys[l]].rx, tx: prevCounters[liveKeys[l]].tx };
+            }
+            usageData.lastCounters = mergedCounters;
             pruneOldDays();
 
             pluginService.savePluginState(pluginId, "days", usageData.days);
-            pluginService.savePluginState(pluginId, "lastRxBytes", usageData.lastRxBytes);
-            pluginService.savePluginState(pluginId, "lastTxBytes", usageData.lastTxBytes);
-            pluginService.savePluginState(pluginId, "lastInterface", usageData.lastInterface);
-            pluginService.savePluginState(pluginId, "lastNetworkName", usageData.lastNetworkName);
+            pluginService.savePluginState(pluginId, "lastCounters", usageData.lastCounters);
+            // Tombstone the pre-1.5 keys so a later load can never re-run the
+            // legacy migration against stale counters
+            pluginService.savePluginState(pluginId, "lastRxBytes", -1);
+            pluginService.savePluginState(pluginId, "lastTxBytes", -1);
+            pluginService.savePluginState(pluginId, "lastInterface", "");
 
             // Only clear once the state was handed to DMS — clearing earlier would
             // silently drop the accumulated bytes if anything above throws
@@ -228,21 +328,73 @@ PluginComponent {
         }
     }
 
-    // ── Get all known networks ──
+    // ── Interface eligibility (poll-time selection) ──
+    // Primary interfaces feed the bar total, todayRx/todayTx, and the network
+    // buckets. Virtual and tunnel interfaces are excluded because their bytes
+    // also traverse an underlay NIC — counting both would double-book traffic
+    // (wg0 over eth0, veth → bridge → physical).
+    function isPrimaryIface(name) {
+        if (_upIfaces[name] === false) return false;
+        // Explicit entries are honored even if virtual or loopback on purpose
+        if (_trackedIfaceNames.length > 0) return _trackedIfaceNames.indexOf(name) !== -1;
+        if (name === "lo") return false;
+        if (name.startsWith("docker") || name.startsWith("br-") ||
+            name.startsWith("veth") || name.startsWith("virbr")) return false;
+        if (name.startsWith("wg") || name.startsWith("tun") || name.startsWith("tap")) return false;
+        return true;
+    }
+
+    // Group-pattern matches additionally track non-primary interfaces (VPN
+    // tunnels, docker bridges, …) for the per-group views only — never into
+    // the overall totals. An explicit Tracked Interfaces allowlist wins:
+    // groups then only organize what the allowlist already tracks.
+    function isGroupExtraIface(name) {
+        if (_upIfaces[name] === false) return false;
+        if (_trackedIfaceNames.length > 0) return false;
+        return _compiledGroups.length > 0 && groupForIface(name) !== "Other";
+    }
+
+    // ── Get all known networks (SSIDs / iface names) in history + today ──
     function getAvailableNetworks() {
-        if (!usageData || !usageData.days) return ["All"];
-        var nets = {"All": true};
-        var keys = Object.keys(usageData.days);
+        var nets = {};
+        var days = (usageData && usageData.days) ? usageData.days : {};
+        var keys = Object.keys(days);
         for (var i = 0; i < keys.length; i++) {
-            var n = usageData.days[keys[i]].networks;
-            if (n) {
-                var nKeys = Object.keys(n);
-                for (var j = 0; j < nKeys.length; j++) {
-                    nets[nKeys[j]] = true;
-                }
+            var n = days[keys[i]].networks;
+            if (!n) continue;
+            var nKeys = Object.keys(n);
+            for (var j = 0; j < nKeys.length; j++) {
+                nets[nKeys[j]] = true;
             }
         }
+        // Today's live buckets may hold a network not yet flushed to days
+        var tKeys = Object.keys(todayNetworks || {});
+        for (var k = 0; k < tKeys.length; k++) {
+            nets[tKeys[k]] = true;
+        }
         return Object.keys(nets);
+    }
+
+    // ── Per-filter rx/tx of one day entry ({rx, tx, networks, interfaces}) ──
+    function filteredDayValues(day) {
+        if (selectedFilterType === "network") {
+            var n = day.networks && day.networks[selectedFilterName];
+            return { rx: (n && n.rx) || 0, tx: (n && n.tx) || 0 };
+        }
+        if (selectedFilterType === "group") {
+            var r = 0;
+            var t = 0;
+            var ifs = day.interfaces || {};
+            var keys = Object.keys(ifs);
+            for (var i = 0; i < keys.length; i++) {
+                if (groupForIface(keys[i]) === selectedFilterName) {
+                    r += ifs[keys[i]].rx || 0;
+                    t += ifs[keys[i]].tx || 0;
+                }
+            }
+            return { rx: r, tx: t };
+        }
+        return { rx: day.rx || 0, tx: day.tx || 0 };
     }
 
     // ── Get sorted history entries (newest first) ──
@@ -259,25 +411,17 @@ PluginComponent {
         keys.sort().reverse();
         for (var i = 0; i < keys.length; i++) {
             var day = keys[i] === todayKey
-                ? { rx: todayRx, tx: todayTx, networks: todayNetworks }
+                ? { rx: todayRx, tx: todayTx, networks: todayNetworks, interfaces: todayInterfaces }
                 : usageData.days[keys[i]];
-            var r = 0;
-            var t = 0;
-            if (selectedNetworkFilter === "All") {
-                r = day.rx || 0;
-                t = day.tx || 0;
-            } else if (day.networks && day.networks[selectedNetworkFilter]) {
-                r = day.networks[selectedNetworkFilter].rx || 0;
-                t = day.networks[selectedNetworkFilter].tx || 0;
-            }
-            if (r === 0 && t === 0 && selectedNetworkFilter !== "All") continue;
+            var v = filteredDayValues(day);
+            if (v.rx === 0 && v.tx === 0 && selectedFilterType !== "all") continue;
 
             entries.push({
                 date: keys[i],
                 label: formatDateLabel(keys[i]),
-                total: r + t,
-                rx: r,
-                tx: t
+                total: v.rx + v.tx,
+                rx: v.rx,
+                tx: v.tx
             });
         }
         return entries;
@@ -306,12 +450,73 @@ PluginComponent {
     // ── Stable ListModel caches (avoid Repeater model rebuild on poll) ──
     ListModel { id: networksModel }
     ListModel { id: historyModel }
+    ListModel { id: groupsModel }
 
     function refreshNetworksModel() {
-        var nets = root.getAvailableNetworks();
         networksModel.clear();
+        networksModel.append({ "name": "All", "type": "all" });
+        var hasExplicitOther = false;
+        for (var g = 0; g < root._compiledGroups.length; g++) {
+            networksModel.append({ "name": root._compiledGroups[g].name, "type": "group" });
+            if (root._compiledGroups[g].name === "Other") hasExplicitOther = true;
+        }
+        if (root._compiledGroups.length > 0 && !hasExplicitOther) {
+            networksModel.append({ "name": "Other", "type": "group" });
+        }
+        var nets = root.getAvailableNetworks();
         for (var i = 0; i < nets.length; i++) {
-            networksModel.append({ "name": nets[i] });
+            networksModel.append({ "name": nets[i], "type": "network" });
+        }
+    }
+
+    // ── Today's bytes for one group (from the per-interface buckets) ──
+    function groupBytesToday(groupName) {
+        var sum = 0;
+        var ifs = todayInterfaces || {};
+        var keys = Object.keys(ifs);
+        for (var i = 0; i < keys.length; i++) {
+            if (groupForIface(keys[i]) === groupName) {
+                sum += (ifs[keys[i]].rx || 0) + (ifs[keys[i]].tx || 0);
+            }
+        }
+        return sum;
+    }
+
+    // Rebuild only when the row set changes; otherwise update values in place
+    // so open-popout polls don't churn delegates
+    function syncGroupsModel() {
+        var desired = [];
+        var hasExplicitOther = false;
+        for (var g = 0; g < _compiledGroups.length; g++) {
+            desired.push({ "name": _compiledGroups[g].name, "bytes": groupBytesToday(_compiledGroups[g].name) });
+            if (_compiledGroups[g].name === "Other") hasExplicitOther = true;
+        }
+        if (_compiledGroups.length > 0 && !hasExplicitOther) {
+            var otherBytes = groupBytesToday("Other");
+            if (otherBytes > 0) desired.push({ "name": "Other", "bytes": otherBytes });
+        }
+
+        var sameShape = groupsModel.count === desired.length;
+        if (sameShape) {
+            for (var i = 0; i < desired.length; i++) {
+                if (groupsModel.get(i).name !== desired[i].name) {
+                    sameShape = false;
+                    break;
+                }
+            }
+        }
+        if (sameShape) {
+            for (var j = 0; j < desired.length; j++) {
+                if (groupsModel.get(j).bytes !== desired[j].bytes) {
+                    groupsModel.setProperty(j, "bytes", desired[j].bytes);
+                }
+            }
+        } else {
+            groupsModel.clear();
+            for (var k = 0; k < desired.length; k++) {
+                groupsModel.append(desired[k]);
+            }
+            root.updatePopoutHeight();
         }
     }
 
@@ -323,10 +528,25 @@ PluginComponent {
         }
     }
 
+    // ── Height contributed by the group rows + per-app sticky sections ──
+    function stickyExtrasHeight() {
+        var h = 0;
+        if (root.interfaceFound && groupsModel.count > 0) {
+            // rows + inner spacing + the stickyTop column spacing above the section
+            h += groupsModel.count * root.groupRowHeight
+                 + (groupsModel.count - 1) * Theme.spacingXS + Theme.spacingM;
+        }
+        if (root.perAppTraffic) {
+            h += root._perAppSectionH + Theme.spacingM;
+        }
+        return h;
+    }
+
     // ── Update Popout Height dynamically ──
     function updatePopoutHeight() {
         if (!root.historyExpanded) {
-            root.popoutHeight = root.interfaceFound ? root.collapsedPopoutHeight : root.offlinePopoutHeight;
+            root.popoutHeight = (root.interfaceFound ? root.collapsedPopoutHeight : root.offlinePopoutHeight)
+                                + root.stickyExtrasHeight();
         } else {
             root._maxDailyUsage = root.getMaxDailyUsage();
             
@@ -346,7 +566,10 @@ PluginComponent {
             // collapsedPopoutHeight + historySection.topMargin (12).
             // Without the 12px offset, historySection is 12px shorter than historyH,
             // causing the DankListView to clip its bottom entry and show a scrollbar!
-            root.popoutHeight = Math.min(root.collapsedPopoutHeight + 12 + historyH, root.maxPopoutHeight);
+            // The history list itself scrolls, so the cap only squeezes the list.
+            root.popoutHeight = Math.min(
+                root.collapsedPopoutHeight + root.stickyExtrasHeight() + 12 + historyH,
+                root.maxPopoutHeight);
         }
     }
 
@@ -369,20 +592,18 @@ PluginComponent {
                     root.todayRx = root.usageData.days[currentKey].rx || 0;
                     root.todayTx = root.usageData.days[currentKey].tx || 0;
                     root.todayNetworks = JSON.parse(JSON.stringify(root.usageData.days[currentKey].networks || {}));
+                    root.todayInterfaces = JSON.parse(JSON.stringify(root.usageData.days[currentKey].interfaces || {}));
                 } else {
                     root.todayRx = 0;
                     root.todayTx = 0;
                     root.todayNetworks = {};
+                    root.todayInterfaces = {};
                 }
             }
 
-            root._foundThisCycle = false;
-            root._activeIfaceThisCycle = "";
-            root._activeSsidThisCycle = "";
+            root._cycleCounters = {};
             root._upIfaces = {};
             root._ssidByIface = {};
-            root._tempDeltaRx = 0;
-            root._tempDeltaTx = 0;
             netProcess.running = true;
         }
     }
@@ -423,7 +644,7 @@ PluginComponent {
         stdout: SplitParser {
             onRead: line => {
                 // SSID/OPSTATE lines arrive before the /proc/net/dev output;
-                // collect them into per-cycle lookup maps used at selection time
+                // collect them into per-cycle lookup maps used in onExited
                 if (line.startsWith("SSID:")) {
                     var sparts = line.split(":");
                     // slice(2) handles SSIDs containing colons; keep "" so the
@@ -440,98 +661,22 @@ PluginComponent {
                     return;
                 }
 
-                // Already found our interface this cycle — skip remaining lines
-                if (root._foundThisCycle) return;
-
-                // Lines look like: "  eth0: 12345 ... 67890 ..."
+                // /proc/net/dev rows look like: "  eth0: 12345 ... 67890 ..."
                 var trimmed = line.trim();
-                if (trimmed.indexOf(":") === -1) return;
+                var colon = trimmed.indexOf(":");
+                if (colon <= 0) return;
 
-                var parts = trimmed.split(":");
-                var ifaceName = parts[0].trim();
-
-                if (root._trackedIfaceNames.length > 0) {
-                    // Explicit selection: only listed interfaces are eligible
-                    // (an explicit entry may be virtual or loopback on purpose)
-                    if (root._trackedIfaceNames.indexOf(ifaceName) === -1) return;
-                } else {
-                    // Automatic: skip loopback and virtual interfaces, use first real interface
-                    if (ifaceName === "lo") return;
-                    if (ifaceName.startsWith("docker") || ifaceName.startsWith("br-") ||
-                        ifaceName.startsWith("veth") || ifaceName.startsWith("virbr")) return;
-                }
-
-                // Skip interfaces known to be down so a dead first interface
-                // (e.g. unplugged ethernet) can't mask a working later one
-                if (root._upIfaces[ifaceName] === false) return;
-
-                // Lock in this interface for the cycle
-                root._foundThisCycle = true;
-                root._activeIfaceThisCycle = ifaceName;
-                root._activeSsidThisCycle = root._ssidByIface[ifaceName] || "";
-
-                // Counters from a different NIC are incomparable — drop one
-                // sample instead of booking the difference as usage (can be
-                // many GB when switching e.g. ethernet → wifi)
-                if (!root.firstPollAfterLoad && root._lastPolledIface !== "" &&
-                    ifaceName !== root._lastPolledIface) {
-                    root.prevRxBytes = -1;
-                    root.prevTxBytes = -1;
-                }
-                root._lastPolledIface = ifaceName;
-
-                var stats = parts[1].trim().split(/\s+/);
+                var ifaceName = trimmed.substring(0, colon).trim();
+                var stats = trimmed.substring(colon + 1).trim().split(/\s+/);
                 // columns: rx_bytes rx_packets ... (8 rx fields) tx_bytes tx_packets ...
-                var rxBytes = parseFloat(stats[0]) || 0;
-                var txBytes = parseFloat(stats[8]) || 0;
+                var rxBytes = parseFloat(stats[0]);
+                var txBytes = parseFloat(stats[8]);
+                if (!ifaceName || !isFinite(rxBytes) || !isFinite(txBytes)) return;
 
-                // ── First poll after loading saved data: recover gap ──
-                if (root.firstPollAfterLoad) {
-                    root.firstPollAfterLoad = false;
-                    var savedRx = root.usageData.lastRxBytes || -1;
-                    var savedTx = root.usageData.lastTxBytes || -1;
-                    var savedIface = root.usageData.lastInterface || "";
-
-                    // Only recover gap if same interface (different interface = unreliable counters)
-                    if (savedRx >= 0 && savedTx >= 0 && savedIface === ifaceName) {
-                        // Counters grew since last save → data accumulated while plugin was off
-                        var gapRx = rxBytes - savedRx;
-                        var gapTx = txBytes - savedTx;
-                        if (gapRx >= 0 && gapTx >= 0) {
-                            root._tempDeltaRx = gapRx;
-                            root._tempDeltaTx = gapTx;
-                            root.todayRx += gapRx;
-                            root.todayTx += gapTx;
-                        }
-                        // If negative, counter reset (reboot) — don't add gap, start fresh delta
-                    }
-                    root.prevRxBytes = rxBytes;
-                    root.prevTxBytes = txBytes;
-                    // Note: Gap recovery is saved when process exits (so SSID is ready)
-                    return;
-                }
-
-                // ── Normal delta accumulation ──
-                if (root.prevRxBytes >= 0 && root.prevTxBytes >= 0) {
-                    var deltaRx = rxBytes - root.prevRxBytes;
-                    var deltaTx = txBytes - root.prevTxBytes;
-                    var elapsed = root.updateInterval;
-
-                    // Speed calculation
-                    root.downloadSpeed = Math.max(0, deltaRx / elapsed);
-                    root.uploadSpeed = Math.max(0, deltaTx / elapsed);
-
-                    // Accumulate to daily total (only positive deltas)
-                    root._tempDeltaRx = Math.max(0, deltaRx);
-                    root._tempDeltaTx = Math.max(0, deltaTx);
-                    
-                    if (deltaRx > 0) root.todayRx += deltaRx;
-                    if (deltaTx > 0) root.todayTx += deltaTx;
-                }
-
-                root.prevRxBytes = rxBytes;
-                root.prevTxBytes = txBytes;
-                // Wait for exit to save so we have the SSID
+                // Just collect raw counters for every interface; eligibility,
+                // deltas, and attribution happen in onExited once operstates
+                // and SSIDs are all known
+                root._cycleCounters[ifaceName] = { rx: rxBytes, tx: txBytes };
             }
         }
         stderr: SplitParser {
@@ -544,52 +689,136 @@ PluginComponent {
             }
             root._lastPollFailed = (exitCode !== 0);
 
-            // Update interfaceFound ONLY after the full read completes (no flicker)
-            root.interfaceFound = root._foundThisCycle;
+            var all = Object.keys(root._cycleCounters);
 
-            if (!root._foundThisCycle) {
-                root.downloadSpeed = 0;
-                root.uploadSpeed = 0;
-                root.prevRxBytes = -1;
-                root.prevTxBytes = -1;
-            } else {
-                root.currentNetworkName = root._activeSsidThisCycle || root._activeIfaceThisCycle;
+            // Speed must divide by the real time between counter reads: after
+            // a failed/empty cycle the next delta spans 2+ intervals and would
+            // otherwise display as a bogus spike
+            var now = Date.now();
+            var elapsedSec = root._lastPollMs > 0
+                ? Math.max(0.5, (now - root._lastPollMs) / 1000)
+                : root.updateInterval;
+            if (all.length > 0) root._lastPollMs = now;
 
-                if (root._tempDeltaRx > 0 || root._tempDeltaTx > 0) {
-                    var net = root.todayNetworks[root.currentNetworkName] || { rx: 0, tx: 0 };
-                    net.rx += root._tempDeltaRx;
-                    net.tx += root._tempDeltaTx;
-                    // QML requires re-assigning the object to trigger property bindings for dicts sometimes, 
-                    // or modifying it directly might not persist if not careful.
-                    var newDict = JSON.parse(JSON.stringify(root.todayNetworks));
-                    newDict[root.currentNetworkName] = net;
-                    root.todayNetworks = newDict;
+            var speedRx = 0;    // primary deltas only (drives the bar)
+            var speedTx = 0;
+            var bookedRx = 0;   // primary bytes booked to the overall totals
+            var bookedTx = 0;
+            var bookedUnsaved = 0; // all booked bytes incl. group extras (flush accounting)
+            var bookedAny = false;
+            var anyPrimary = false;
+            // Deep copies: reassigning the dicts once per cycle is what makes
+            // QML bindings on them re-evaluate
+            var newNetworks = JSON.parse(JSON.stringify(root.todayNetworks));
+            var newInterfaces = JSON.parse(JSON.stringify(root.todayInterfaces));
 
-                    // Update the model dynamically without rebuilding if expanded
-                    if (root.historyExpanded && historyModel.count > 0) {
-                        var topEntry = historyModel.get(0);
-                        if (topEntry.date === root.todayKey) {
-                            var r = 0;
-                            var t = 0;
-                            if (root.selectedNetworkFilter === "All") {
-                                r = root.todayRx;
-                                t = root.todayTx;
-                            } else if (root.todayNetworks[root.selectedNetworkFilter]) {
-                                r = root.todayNetworks[root.selectedNetworkFilter].rx || 0;
-                                t = root.todayNetworks[root.selectedNetworkFilter].tx || 0;
+            // Baselines advance for EVERY interface seen — including currently
+            // ineligible ones — so a later eligibility change (settings edit,
+            // group added) books one interval's worth, not the whole interim
+            for (var i = 0; i < all.length; i++) {
+                var iface = all[i];
+                var cur = root._cycleCounters[iface];
+                var primary = root.isPrimaryIface(iface);
+                var tracked = primary || root.isGroupExtraIface(iface);
+                if (primary) anyPrimary = true;
+
+                var deltaRx = 0;
+                var deltaTx = 0;
+                var isGap = false;
+                var prev = root.prevCounters[iface];
+                if (!prev) {
+                    // First sighting since load: consume the saved baseline to
+                    // recover bytes that accumulated while the plugin was off.
+                    // A negative gap means the counters reset (reboot) — start
+                    // fresh instead of booking garbage.
+                    var saved = (root.usageData.lastCounters || {})[iface];
+                    if (saved) {
+                        delete root.usageData.lastCounters[iface];
+                        if (tracked) {
+                            var gapRx = cur.rx - saved.rx;
+                            var gapTx = cur.tx - saved.tx;
+                            if (gapRx >= 0 && gapTx >= 0) {
+                                deltaRx = gapRx;
+                                deltaTx = gapTx;
+                                isGap = true; // usage, but not current speed
                             }
-                            historyModel.setProperty(0, "rx", r);
-                            historyModel.setProperty(0, "tx", t);
-                            historyModel.setProperty(0, "total", r + t);
                         }
+                    }
+                } else if (tracked) {
+                    var dRx = cur.rx - prev.rx;
+                    var dTx = cur.tx - prev.tx;
+                    // Negative delta = counter reset (e.g. USB NIC replug)
+                    // → drop this interface's sample, keep the others
+                    if (dRx >= 0 && dTx >= 0) {
+                        deltaRx = dRx;
+                        deltaTx = dTx;
+                    }
+                }
+                root.prevCounters[iface] = { rx: cur.rx, tx: cur.tx };
+
+                if (deltaRx > 0 || deltaTx > 0) {
+                    bookedAny = true;
+                    bookedUnsaved += deltaRx + deltaTx;
+                    var ifc = newInterfaces[iface] || { rx: 0, tx: 0 };
+                    ifc.rx += deltaRx;
+                    ifc.tx += deltaTx;
+                    newInterfaces[iface] = ifc;
+
+                    if (primary) {
+                        // Only primaries feed the totals; group-tracked extras
+                        // (tunnels, bridges) would double-count the same bytes
+                        bookedRx += deltaRx;
+                        bookedTx += deltaTx;
+                        if (!isGap) {
+                            speedRx += deltaRx;
+                            speedTx += deltaTx;
+                        }
+                        var netName = root._ssidByIface[iface] || iface;
+                        var net = newNetworks[netName] || { rx: 0, tx: 0 };
+                        net.rx += deltaRx;
+                        net.tx += deltaTx;
+                        newNetworks[netName] = net;
+                    }
+                }
+            }
+
+            // Update interfaceFound ONLY after the full read completes (no flicker)
+            root.interfaceFound = anyPrimary;
+
+            root.downloadSpeed = anyPrimary ? speedRx / elapsedSec : 0;
+            root.uploadSpeed = anyPrimary ? speedTx / elapsedSec : 0;
+
+            if (bookedAny) {
+                root.todayRx += bookedRx;
+                root.todayTx += bookedTx;
+                root.todayNetworks = newNetworks;
+                root.todayInterfaces = newInterfaces;
+
+                // Keep the expanded history live: patch today's row in place,
+                // or rebuild once when today newly qualifies under the active
+                // filter (was zero / date rolled over at midnight)
+                if (root.historyExpanded) {
+                    var v = root.filteredDayValues({
+                        rx: root.todayRx, tx: root.todayTx,
+                        networks: root.todayNetworks, interfaces: root.todayInterfaces
+                    });
+                    if (historyModel.count > 0 && historyModel.get(0).date === root.todayKey) {
+                        historyModel.setProperty(0, "rx", v.rx);
+                        historyModel.setProperty(0, "tx", v.tx);
+                        historyModel.setProperty(0, "total", v.rx + v.tx);
+                    } else if (v.rx + v.tx > 0) {
+                        root.refreshHistoryModel();
+                        root.updatePopoutHeight();
                     }
                 }
 
-                root.unsavedBytes += (root._tempDeltaRx + root._tempDeltaTx);
+                root.unsavedBytes += bookedUnsaved;
+            }
 
-                if (root.unsavedBytes >= root.flushThresholdBytes) {
-                    root.saveUsageData();
-                }
+            root.syncGroupsModel();
+
+            if (root.unsavedBytes >= root.flushThresholdBytes) {
+                root.saveUsageData();
             }
         }
     }
@@ -826,9 +1055,11 @@ PluginComponent {
             onVisibleChanged: {
                 if (visible) {
                     root.historyExpanded = false;
-                    root.popoutHeight = root.interfaceFound ? root.collapsedPopoutHeight : root.offlinePopoutHeight;
+                    root.syncGroupsModel();
+                    root.updatePopoutHeight();
                 } else {
-                    root.selectedNetworkFilter = "All";
+                    root.selectedFilterType = "all";
+                    root.selectedFilterName = "All";
                 }
             }
 
@@ -1062,7 +1293,8 @@ PluginComponent {
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
                                 root.historyExpanded = !root.historyExpanded;
-                                root.selectedNetworkFilter = "All";
+                                root.selectedFilterType = "all";
+                                root.selectedFilterName = "All";
                                 if (root.historyExpanded) {
                                     root.refreshNetworksModel();
                                     root.refreshHistoryModel();
@@ -1072,6 +1304,66 @@ PluginComponent {
                                 root.updatePopoutHeight();
                             }
                         }
+                    }
+
+                    // ── Per-group usage today (only when groups are defined) ──
+                    Column {
+                        width: parent.width
+                        spacing: Theme.spacingXS
+                        visible: root.interfaceFound && groupsModel.count > 0
+
+                        Repeater {
+                            model: groupsModel
+
+                            StyledRect {
+                                id: groupRow
+                                required property string name
+                                required property real bytes
+
+                                width: parent.width
+                                height: root.groupRowHeight
+                                radius: Theme.cornerRadius / 2
+                                color: Qt.rgba(Theme.surfaceVariantText.r, Theme.surfaceVariantText.g, Theme.surfaceVariantText.b, 0.1)
+
+                                Row {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: Theme.spacingS
+                                    anchors.rightMargin: Theme.spacingS
+                                    spacing: Theme.spacingS
+
+                                    StyledText {
+                                        text: groupRow.name
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        color: Theme.surfaceText
+                                        elide: Text.ElideRight
+                                        width: parent.width - groupBytesLabel.width - Theme.spacingS
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+
+                                    StyledText {
+                                        id: groupBytesLabel
+                                        text: root.formatBytes(groupRow.bytes)
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        font.weight: Font.Bold
+                                        color: Theme.surfaceVariantText
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Live per-app traffic (optional, needs nethogs) ──
+                    PerAppSection {
+                        width: parent.width
+                        visible: root.perAppTraffic
+                        active: popoutColumn.visible && root.perAppTraffic
+                        formatSpeedFn: root.formatSpeed
+                        onSectionHeightChanged: {
+                            root._perAppSectionH = sectionHeight;
+                            root.updatePopoutHeight();
+                        }
+                        Component.onCompleted: root._perAppSectionH = sectionHeight
                     }
                 } // end stickyTop Column
 
@@ -1127,13 +1419,18 @@ PluginComponent {
                                 StyledRect {
                                     id: filterChip
                                     required property string name
+                                    required property string type
+                                    // Group and SSID chips may share a label; the
+                                    // type keeps the selection unambiguous
+                                    readonly property bool selected: root.selectedFilterType === filterChip.type
+                                                                     && root.selectedFilterName === filterChip.name
                                     height: 32
                                     width: filterText.implicitWidth + Theme.spacingM * 2
                                     radius: 16
-                                    color: root.selectedNetworkFilter === filterChip.name 
+                                    color: filterChip.selected
                                         ? Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.2)
                                         : Qt.rgba(Theme.surfaceVariantText.r, Theme.surfaceVariantText.g, Theme.surfaceVariantText.b, 0.1)
-                                    border.width: root.selectedNetworkFilter === filterChip.name ? 1 : 0
+                                    border.width: filterChip.selected ? 1 : 0
                                     border.color: Theme.primary
 
                                     Behavior on color { ColorAnimation { duration: 150 } }
@@ -1143,15 +1440,16 @@ PluginComponent {
                                         anchors.centerIn: parent
                                         text: filterChip.name
                                         font.pixelSize: Theme.fontSizeSmall
-                                        font.weight: root.selectedNetworkFilter === filterChip.name ? Font.Bold : Font.Normal
-                                        color: root.selectedNetworkFilter === filterChip.name ? Theme.primary : Theme.surfaceVariantText
+                                        font.weight: filterChip.selected ? Font.Bold : Font.Normal
+                                        color: filterChip.selected ? Theme.primary : Theme.surfaceVariantText
                                     }
 
                                     MouseArea {
                                         anchors.fill: parent
                                         cursorShape: Qt.PointingHandCursor
                                         onClicked: {
-                                            root.selectedNetworkFilter = filterChip.name;
+                                            root.selectedFilterType = filterChip.type;
+                                            root.selectedFilterName = filterChip.name;
                                             root.refreshHistoryModel();
                                             root.updatePopoutHeight();
                                         }
@@ -1333,7 +1631,7 @@ PluginComponent {
 
                                 StyledText {
                                     id: overallLabel
-                                    text: root.selectedNetworkFilter ? root.formatBytes(root.getOverallUsage().total) : ""
+                                    text: root.formatBytes(root.getOverallUsage().total)
                                     font.pixelSize: Theme.fontSizeSmall
                                     font.weight: Font.Bold
                                     color: Theme.surfaceText
