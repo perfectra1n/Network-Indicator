@@ -59,10 +59,28 @@ PluginSettings {
     ListSettingWithInput {
         settingKey: "trackedInterfaces"
         label: "Tracked Interfaces"
-        description: "Only consider these interfaces when tracking (the first active one is used). Leave empty to pick the active interface automatically. Use names exactly as they appear in /sys/class/net, e.g. \"wlan0\" or \"enp3s0\"."
+        description: "Only track these interfaces (their traffic is summed). Leave empty to track all real interfaces automatically. Use names exactly as they appear in /sys/class/net, e.g. \"wlan0\" or \"enp3s0\"."
         fields: [
             { id: "name", placeholder: "e.g. wlan0", required: true, width: 200 }
         ]
         defaultValue: []
+    }
+
+    ListSettingWithInput {
+        settingKey: "interfaceGroups"
+        label: "Interface Groups"
+        description: "Group interfaces by name pattern and view each group's traffic in the popout and history. Patterns are regular expressions matched against the whole interface name (a plain name like \"wlan0\" also works). Groups are ordered: an interface counts toward the first matching group; unmatched interfaces land in \"Other\"."
+        fields: [
+            { id: "name", placeholder: "e.g. VPN", required: true, width: 120 },
+            { id: "pattern", placeholder: "e.g. (wg|tun).*", required: true, width: 170 }
+        ]
+        defaultValue: []
+    }
+
+    ToggleSetting {
+        settingKey: "perAppTraffic"
+        label: "Per-App Traffic"
+        description: "Show live per-application traffic in the popout while it is open. Requires nethogs with packet-capture capabilities: sudo setcap 'cap_net_admin,cap_net_raw+ep' $(command -v nethogs)"
+        defaultValue: false
     }
 }
