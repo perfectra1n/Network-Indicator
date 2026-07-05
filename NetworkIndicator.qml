@@ -81,6 +81,12 @@ PluginComponent {
         if (!dataLoaded) return;
         updatePopoutHeight();
     }
+    // Going offline swaps the popout base height and hides the group rows;
+    // coming back does the reverse — both need a height recompute
+    onInterfaceFoundChanged: {
+        if (!dataLoaded) return;
+        updatePopoutHeight();
+    }
 
     // ── Internal state ──
     property real downloadSpeed: 0
@@ -101,7 +107,7 @@ PluginComponent {
     property var todayInterfaces: ({})  // today's usage per interface
     property string todayKey: ""        // "yyyy-MM-dd" for current day
     property bool dataLoaded: false     // whether initial JSON was loaded
-    property bool firstPollAfterLoad: true // first poll needs special delta handling
+    property double _lastPollMs: 0      // wall time of the last counter read (real elapsed for speed)
     property bool historyExpanded: false // whether 30-day history panel is shown
     property real _maxDailyUsage: 1      // cached max for bar proportions (avoid O(n²))
     property string selectedFilterType: "all"  // "all" | "group" | "network"
@@ -269,7 +275,6 @@ PluginComponent {
         }
 
         dataLoaded = true;
-        firstPollAfterLoad = true;
     }
 
     // ── Persistence: save via DMS Plugin State API (auto-debounced 150ms) ──
@@ -278,7 +283,19 @@ PluginComponent {
 
         try {
             usageData.days[todayKey] = { rx: todayRx, tx: todayTx, networks: todayNetworks, interfaces: todayInterfaces };
-            usageData.lastCounters = prevCounters;
+            // Merge live baselines over the saved ones: interfaces not seen
+            // since load keep their saved baseline so their offline gap can
+            // still be recovered whenever they next appear
+            var mergedCounters = {};
+            var savedKeys = Object.keys(usageData.lastCounters || {});
+            for (var s = 0; s < savedKeys.length; s++) {
+                mergedCounters[savedKeys[s]] = usageData.lastCounters[savedKeys[s]];
+            }
+            var liveKeys = Object.keys(prevCounters);
+            for (var l = 0; l < liveKeys.length; l++) {
+                mergedCounters[liveKeys[l]] = { rx: prevCounters[liveKeys[l]].rx, tx: prevCounters[liveKeys[l]].tx };
+            }
+            usageData.lastCounters = mergedCounters;
             pruneOldDays();
 
             pluginService.savePluginState(pluginId, "days", usageData.days);
@@ -312,16 +329,29 @@ PluginComponent {
     }
 
     // ── Interface eligibility (poll-time selection) ──
-    function isEligibleIface(name) {
+    // Primary interfaces feed the bar total, todayRx/todayTx, and the network
+    // buckets. Virtual and tunnel interfaces are excluded because their bytes
+    // also traverse an underlay NIC — counting both would double-book traffic
+    // (wg0 over eth0, veth → bridge → physical).
+    function isPrimaryIface(name) {
         if (_upIfaces[name] === false) return false;
         // Explicit entries are honored even if virtual or loopback on purpose
-        if (_trackedIfaceNames.indexOf(name) !== -1) return true;
-        if (_compiledGroups.length > 0 && groupForIface(name) !== "Other") return true;
-        if (_trackedIfaceNames.length > 0) return false; // allowlist active
+        if (_trackedIfaceNames.length > 0) return _trackedIfaceNames.indexOf(name) !== -1;
         if (name === "lo") return false;
         if (name.startsWith("docker") || name.startsWith("br-") ||
             name.startsWith("veth") || name.startsWith("virbr")) return false;
+        if (name.startsWith("wg") || name.startsWith("tun") || name.startsWith("tap")) return false;
         return true;
+    }
+
+    // Group-pattern matches additionally track non-primary interfaces (VPN
+    // tunnels, docker bridges, …) for the per-group views only — never into
+    // the overall totals. An explicit Tracked Interfaces allowlist wins:
+    // groups then only organize what the allowlist already tracks.
+    function isGroupExtraIface(name) {
+        if (_upIfaces[name] === false) return false;
+        if (_trackedIfaceNames.length > 0) return false;
+        return _compiledGroups.length > 0 && groupForIface(name) !== "Other";
     }
 
     // ── Get all known networks (SSIDs / iface names) in history + today ──
@@ -660,111 +690,129 @@ PluginComponent {
             root._lastPollFailed = (exitCode !== 0);
 
             var all = Object.keys(root._cycleCounters);
-            var eligible = [];
-            for (var e = 0; e < all.length; e++) {
-                if (root.isEligibleIface(all[e])) eligible.push(all[e]);
-            }
 
-            // Update interfaceFound ONLY after the full read completes (no flicker)
-            root.interfaceFound = eligible.length > 0;
+            // Speed must divide by the real time between counter reads: after
+            // a failed/empty cycle the next delta spans 2+ intervals and would
+            // otherwise display as a bogus spike
+            var now = Date.now();
+            var elapsedSec = root._lastPollMs > 0
+                ? Math.max(0.5, (now - root._lastPollMs) / 1000)
+                : root.updateInterval;
+            if (all.length > 0) root._lastPollMs = now;
 
-            if (eligible.length === 0) {
-                root.downloadSpeed = 0;
-                root.uploadSpeed = 0;
-                // Keep prevCounters: /proc counters survive link-down, so an
-                // interface coming back up continues from its old baseline.
-                // Keep firstPollAfterLoad too — gap recovery still applies to
-                // the first cycle that actually sees an eligible interface.
-                return;
-            }
-
-            var speedRx = 0;   // this cycle's rate-relevant deltas
+            var speedRx = 0;    // primary deltas only (drives the bar)
             var speedTx = 0;
-            var bookedRx = 0;  // bytes booked to usage this cycle
+            var bookedRx = 0;   // primary bytes booked to the overall totals
             var bookedTx = 0;
+            var bookedUnsaved = 0; // all booked bytes incl. group extras (flush accounting)
+            var bookedAny = false;
+            var anyPrimary = false;
             // Deep copies: reassigning the dicts once per cycle is what makes
             // QML bindings on them re-evaluate
             var newNetworks = JSON.parse(JSON.stringify(root.todayNetworks));
             var newInterfaces = JSON.parse(JSON.stringify(root.todayInterfaces));
 
-            for (var i = 0; i < eligible.length; i++) {
-                var iface = eligible[i];
+            // Baselines advance for EVERY interface seen — including currently
+            // ineligible ones — so a later eligibility change (settings edit,
+            // group added) books one interval's worth, not the whole interim
+            for (var i = 0; i < all.length; i++) {
+                var iface = all[i];
                 var cur = root._cycleCounters[iface];
+                var primary = root.isPrimaryIface(iface);
+                var tracked = primary || root.isGroupExtraIface(iface);
+                if (primary) anyPrimary = true;
+
                 var deltaRx = 0;
                 var deltaTx = 0;
-
-                if (root.firstPollAfterLoad) {
-                    // Recover bytes that accumulated while the plugin was off;
-                    // a negative gap means the counters reset (reboot) — start
-                    // fresh instead of booking garbage. Gap counts as usage
-                    // but not as current speed.
+                var isGap = false;
+                var prev = root.prevCounters[iface];
+                if (!prev) {
+                    // First sighting since load: consume the saved baseline to
+                    // recover bytes that accumulated while the plugin was off.
+                    // A negative gap means the counters reset (reboot) — start
+                    // fresh instead of booking garbage.
                     var saved = (root.usageData.lastCounters || {})[iface];
                     if (saved) {
-                        var gapRx = cur.rx - saved.rx;
-                        var gapTx = cur.tx - saved.tx;
-                        if (gapRx >= 0 && gapTx >= 0) {
-                            deltaRx = gapRx;
-                            deltaTx = gapTx;
+                        delete root.usageData.lastCounters[iface];
+                        if (tracked) {
+                            var gapRx = cur.rx - saved.rx;
+                            var gapTx = cur.tx - saved.tx;
+                            if (gapRx >= 0 && gapTx >= 0) {
+                                deltaRx = gapRx;
+                                deltaTx = gapTx;
+                                isGap = true; // usage, but not current speed
+                            }
                         }
                     }
-                } else {
-                    var prev = root.prevCounters[iface];
-                    if (prev) {
-                        var dRx = cur.rx - prev.rx;
-                        var dTx = cur.tx - prev.tx;
-                        // Negative delta = counter reset (e.g. USB NIC replug)
-                        // → drop this interface's sample, keep the others
-                        if (dRx >= 0 && dTx >= 0) {
-                            deltaRx = dRx;
-                            deltaTx = dTx;
-                            speedRx += dRx;
-                            speedTx += dTx;
-                        }
+                } else if (tracked) {
+                    var dRx = cur.rx - prev.rx;
+                    var dTx = cur.tx - prev.tx;
+                    // Negative delta = counter reset (e.g. USB NIC replug)
+                    // → drop this interface's sample, keep the others
+                    if (dRx >= 0 && dTx >= 0) {
+                        deltaRx = dRx;
+                        deltaTx = dTx;
                     }
-                    // No prev entry (newly appeared iface) → just seed below
                 }
                 root.prevCounters[iface] = { rx: cur.rx, tx: cur.tx };
 
                 if (deltaRx > 0 || deltaTx > 0) {
-                    bookedRx += deltaRx;
-                    bookedTx += deltaTx;
-                    var netName = root._ssidByIface[iface] || iface;
-                    var net = newNetworks[netName] || { rx: 0, tx: 0 };
-                    net.rx += deltaRx;
-                    net.tx += deltaTx;
-                    newNetworks[netName] = net;
+                    bookedAny = true;
+                    bookedUnsaved += deltaRx + deltaTx;
                     var ifc = newInterfaces[iface] || { rx: 0, tx: 0 };
                     ifc.rx += deltaRx;
                     ifc.tx += deltaTx;
                     newInterfaces[iface] = ifc;
+
+                    if (primary) {
+                        // Only primaries feed the totals; group-tracked extras
+                        // (tunnels, bridges) would double-count the same bytes
+                        bookedRx += deltaRx;
+                        bookedTx += deltaTx;
+                        if (!isGap) {
+                            speedRx += deltaRx;
+                            speedTx += deltaTx;
+                        }
+                        var netName = root._ssidByIface[iface] || iface;
+                        var net = newNetworks[netName] || { rx: 0, tx: 0 };
+                        net.rx += deltaRx;
+                        net.tx += deltaTx;
+                        newNetworks[netName] = net;
+                    }
                 }
             }
 
-            root.firstPollAfterLoad = false;
-            root.downloadSpeed = speedRx / root.updateInterval;
-            root.uploadSpeed = speedTx / root.updateInterval;
+            // Update interfaceFound ONLY after the full read completes (no flicker)
+            root.interfaceFound = anyPrimary;
 
-            if (bookedRx > 0 || bookedTx > 0) {
+            root.downloadSpeed = anyPrimary ? speedRx / elapsedSec : 0;
+            root.uploadSpeed = anyPrimary ? speedTx / elapsedSec : 0;
+
+            if (bookedAny) {
                 root.todayRx += bookedRx;
                 root.todayTx += bookedTx;
                 root.todayNetworks = newNetworks;
                 root.todayInterfaces = newInterfaces;
 
-                // Update the model dynamically without rebuilding if expanded
-                if (root.historyExpanded && historyModel.count > 0) {
-                    var topEntry = historyModel.get(0);
-                    if (topEntry.date === root.todayKey) {
-                        var v = root.filteredDayValues({
-                            rx: root.todayRx, tx: root.todayTx,
-                            networks: root.todayNetworks, interfaces: root.todayInterfaces
-                        });
+                // Keep the expanded history live: patch today's row in place,
+                // or rebuild once when today newly qualifies under the active
+                // filter (was zero / date rolled over at midnight)
+                if (root.historyExpanded) {
+                    var v = root.filteredDayValues({
+                        rx: root.todayRx, tx: root.todayTx,
+                        networks: root.todayNetworks, interfaces: root.todayInterfaces
+                    });
+                    if (historyModel.count > 0 && historyModel.get(0).date === root.todayKey) {
                         historyModel.setProperty(0, "rx", v.rx);
                         historyModel.setProperty(0, "tx", v.tx);
                         historyModel.setProperty(0, "total", v.rx + v.tx);
+                    } else if (v.rx + v.tx > 0) {
+                        root.refreshHistoryModel();
+                        root.updatePopoutHeight();
                     }
                 }
 
-                root.unsavedBytes += (bookedRx + bookedTx);
+                root.unsavedBytes += bookedUnsaved;
             }
 
             root.syncGroupsModel();

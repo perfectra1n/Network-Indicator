@@ -69,7 +69,7 @@ PluginSettings {
     ListSettingWithInput {
         settingKey: "interfaceGroups"
         label: "Interface Groups"
-        description: "Group interfaces by name pattern and view each group's traffic in the popout and history. Patterns are regular expressions matched against the whole interface name (a plain name like \"wlan0\" also works). Groups are ordered: an interface counts toward the first matching group; unmatched interfaces land in \"Other\"."
+        description: "Group interfaces by name pattern and view each group's traffic in the popout and history. Patterns are regular expressions matched against the whole interface name (a plain name like \"wlan0\" also works). Groups are ordered: an interface counts toward the first matching group; unmatched interfaces land in \"Other\". Virtual/tunnel interfaces matched by a group are shown in that group only — the bar total always counts physical interfaces once."
         fields: [
             { id: "name", placeholder: "e.g. VPN", required: true, width: 120 },
             { id: "pattern", placeholder: "e.g. (wg|tun).*", required: true, width: 170 }

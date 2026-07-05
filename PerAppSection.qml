@@ -21,14 +21,12 @@ Column {
 
     // Reported to the popout so it can budget popoutHeight from constants
     // instead of live item sizes (see the layout-race note in
-    // NetworkIndicator.qml's updatePopoutHeight)
+    // NetworkIndicator.qml's updatePopoutHeight). The rows area is reserved
+    // at maxRows so the popout doesn't animate every time the app list churns.
     readonly property real sectionHeight: {
         var h = 18 + Theme.spacingXS; // header
         if (status === "missing" || status === "noperm") return h + 48;
-        if (status === "ok" && appsModel.count > 0) {
-            return h + appsModel.count * (rowHeight + Theme.spacingXS);
-        }
-        return h + rowHeight; // "Measuring…" placeholder row
+        return h + maxRows * (rowHeight + Theme.spacingXS);
     }
 
     spacing: Theme.spacingXS
@@ -36,15 +34,32 @@ Column {
     ListModel { id: appsModel }
     // program name → {sent, recv} accumulating the batch currently streaming in
     property var _staging: ({})
+    // The first "Refreshing:" marker precedes any data rows — publishing there
+    // would show a bogus empty "No active traffic" batch
+    property bool _sawFirstMarker: false
+    property int _restarts: 0
 
     onActiveChanged: {
+        // Always stop first; the delayed start below sidesteps the race where
+        // running = true is a no-op because the old process is still dying
+        hogsProcess.running = false;
         if (active) {
             status = "starting";
             _staging = {};
+            _sawFirstMarker = false;
+            _restarts = 0;
             appsModel.clear();
-            hogsProcess.running = true;
+            startTimer.restart();
         } else {
-            hogsProcess.running = false;
+            startTimer.stop();
+        }
+    }
+
+    Timer {
+        id: startTimer
+        interval: 300
+        onTriggered: {
+            if (section.active) hogsProcess.running = true;
         }
     }
 
@@ -104,6 +119,10 @@ Column {
         stdout: SplitParser {
             onRead: line => {
                 if (line.startsWith("Refreshing:")) {
+                    if (!section._sawFirstMarker) {
+                        section._sawFirstMarker = true; // batch 1 starts now
+                        return;
+                    }
                     section.publishStaging();
                     return;
                 }
@@ -125,9 +144,21 @@ Column {
             onRead: line => console.warn("NetworkIndicator: nethogs:", line)
         }
         onExited: exitCode => {
-            if (!section.active) return; // we stopped it ourselves
-            section.status = (exitCode === 127) ? "missing" : "noperm";
-            // No auto-restart — it would just fail again; retried on next open
+            if (!section.active) return;        // we stopped it ourselves
+            if (startTimer.running) return;     // stale exit from a superseded process
+            if (exitCode === 127) {
+                section.status = "missing";
+            } else if (section._sawFirstMarker && section._restarts < 3) {
+                // It was working and died (crash, transient) — restart quietly.
+                // A process that never produced output failed to start: that
+                // is the capabilities case, so don't loop on it.
+                section._restarts++;
+                section._sawFirstMarker = false;
+                section._staging = {};
+                startTimer.restart();
+            } else {
+                section.status = "noperm";
+            }
         }
     }
 

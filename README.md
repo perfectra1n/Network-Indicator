@@ -66,9 +66,16 @@ against the *whole* interface name — `en.*` matches `enp5s0f1`, and a plain na
 group whose pattern matches, and anything unmatched lands in an implicit **Other**
 bucket. Group totals appear in the popout and as filter chips in the 30-day history;
 because grouping is applied at view time, editing a pattern re-groups your existing
-history retroactively. An interface matched by a group pattern is tracked even if it
-would normally be skipped as virtual (docker, veth, …), so a `Docker = (docker|br-|veth).*`
-group does what you'd expect.
+history retroactively.
+
+An interface matched by a group pattern is tracked even if it would normally be
+skipped as virtual (docker, veth, wireguard, …), so `VPN = (wg|tun).*` or
+`Docker = (docker|br-|veth).*` do what you'd expect — **but their bytes only show in
+the group views**. The bar speed and the overall daily totals count *physical*
+(or explicitly tracked) interfaces once; tunnel and bridge traffic also traverses a
+physical NIC, and counting both would double-book every byte. If a **Tracked
+Interfaces** allowlist is set, it wins: groups then only organize the interfaces the
+allowlist already tracks.
 
 ### Per-App Traffic
 
@@ -94,10 +101,13 @@ The plugin reads Linux's built-in network statistics.
 | Per-app rates | `nethogs -t`, optional | Live per-application traffic while the popout is open |
 | Persistence | DMS Plugin State API | Saves daily per-interface usage across reboots (30-day rolling window) |
 
-Every active interface is tracked and the bar shows the sum, ignoring loopback and
-virtual interfaces (docker, veth, etc.) unless a group pattern or an explicit
-**Tracked Interfaces** entry names them. Usage history is stored per interface and
-per WiFi network, so both group chips and network chips can slice the same 30 days.
+Every active physical interface is tracked and the bar shows their sum, ignoring
+loopback, virtual (docker, veth, bridges), and tunnel (wireguard, tun/tap)
+interfaces — tunnel bytes already ride a physical NIC, so counting both would
+double-book them. Group patterns and explicit **Tracked Interfaces** entries can
+additionally track those skipped interfaces (groups show them without inflating the
+totals). Usage history is stored per interface and per WiFi network, so both group
+chips and network chips can slice the same 30 days.
 
 ## 📄 License
 
