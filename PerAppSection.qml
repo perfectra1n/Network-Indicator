@@ -63,14 +63,22 @@ Column {
         }
     }
 
-    // "path/pid/uid" (or pseudo-entries like "unknown TCP/0/0") → display name
+    // nethogs program field → short display name. The field is
+    // "<program>/<pid>/<uid>" where <program> may be a bare comm name
+    // ("claude"), a path ("/proc/self/exe"), a pseudo-entry ("unknown TCP"),
+    // or a FULL command line with arguments (Electron apps) — so strip the
+    // trailing /pid/uid first, then keep only the executable's basename.
     function displayName(prog) {
-        var parts = prog.split("/");
-        if (parts.length >= 3) parts = parts.slice(0, parts.length - 2); // drop pid/uid
-        var path = parts.join("/");
-        var slash = path.lastIndexOf("/");
-        var name = (slash >= 0 ? path.substring(slash + 1) : path).trim();
-        return name || "unknown";
+        var m = prog.match(/^(.*)\/(\d+)\/(\d+)$/);
+        var cmdline = (m ? m[1] : prog).trim();
+        // nethogs pseudo-buckets ("unknown TCP", "unknown UDP") stay verbatim
+        if (cmdline.startsWith("unknown")) return cmdline;
+        var exe = cmdline.split(/\s+/)[0];
+        if (exe.indexOf("/") !== -1) {
+            exe = exe.substring(exe.lastIndexOf("/") + 1);
+        }
+        exe = exe.replace(/^\.+/, "").trim(); // ".spotify-wrapped" → "spotify-wrapped"
+        return exe || "unknown";
     }
 
     // A "Refreshing:" line marks the start of the next batch, so the staged
@@ -206,11 +214,16 @@ Column {
                 text: appRow.name
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceText
+                // StyledText defaults to WordWrap, which beats elide and lets
+                // long names paint over neighboring rows — force one line
+                wrapMode: Text.NoWrap
+                maximumLineCount: 1
                 elide: Text.ElideRight
                 width: parent.width - dlGroup.width - ulGroup.width - Theme.spacingS * 2
                 anchors.verticalCenter: parent.verticalCenter
             }
 
+            // Fixed-width rate columns so the ↓/↑ values align across rows
             Row {
                 id: dlGroup
                 spacing: 2
@@ -226,6 +239,9 @@ Column {
                     text: section.formatSpeedFn ? section.formatSpeedFn(appRow.recv) : ""
                     font.pixelSize: Theme.fontSizeSmall
                     color: Theme.surfaceVariantText
+                    wrapMode: Text.NoWrap
+                    width: 62
+                    horizontalAlignment: Text.AlignRight
                     anchors.verticalCenter: parent.verticalCenter
                 }
             }
@@ -245,6 +261,9 @@ Column {
                     text: section.formatSpeedFn ? section.formatSpeedFn(appRow.sent) : ""
                     font.pixelSize: Theme.fontSizeSmall
                     color: Theme.surfaceVariantText
+                    wrapMode: Text.NoWrap
+                    width: 62
+                    horizontalAlignment: Text.AlignRight
                     anchors.verticalCenter: parent.verticalCenter
                 }
             }

@@ -1335,6 +1335,10 @@ PluginComponent {
                                         text: groupRow.name
                                         font.pixelSize: Theme.fontSizeSmall
                                         color: Theme.surfaceText
+                                        // StyledText defaults to WordWrap which
+                                        // beats elide — force a single line
+                                        wrapMode: Text.NoWrap
+                                        maximumLineCount: 1
                                         elide: Text.ElideRight
                                         width: parent.width - groupBytesLabel.width - Theme.spacingS
                                         anchors.verticalCenter: parent.verticalCenter
