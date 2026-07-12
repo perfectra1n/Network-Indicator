@@ -144,10 +144,32 @@ PluginComponent {
             return bytesPerSec.toFixed(0) + " B/s";
         } else if (bytesPerSec < 1024 * 1024) {
             return (bytesPerSec / 1024).toFixed(1) + " KB/s";
-        } else {
+        } else if (bytesPerSec < 1024 * 1024 * 1024) {
             return (bytesPerSec / (1024 * 1024)).toFixed(2) + " MB/s";
         }
+        // Without this branch a 10GbE link reads "1192.05 MB/s" — six digits, and
+        // wider than any reserve the bar pill can sanely hold (see speedReserveText)
+        return (bytesPerSec / (1024 * 1024 * 1024)).toFixed(2) + " GB/s";
     }
+
+    // Widest string the bar pill can render, per unit mode. The pill reserves this width so it
+    // stops resizing on every poll. Must be a true UPPER BOUND on formatSpeed()'s output: the
+    // label's width binding takes Math.max(content, reserve), so the reserve is a floor, not a
+    // cap — under-reserve and the pill simply grows again, which is the bug.
+    //
+    // Digit counts are bounded by the branch above, at 10GbE line rate (~1.25 GB/s):
+    //   auto/mbps: MB/s runs to "1024.00 MB/s" — FOUR integer digits, not three: the GB/s
+    //              handover is at 1024 MB/s, so 1000.00-1023.99 MB/s (8.4-8.6 Gbps) is
+    //              reachable. " MB/s" also beats " KB/s"/" B/s" at equal digit count
+    //              ('M' 10.84px > 'K' 8.06px), and GB/s ("1.25 GB/s") is far narrower.
+    //   kbps: never switches unit, so 10GbE reads "1220703.1 KB/s" — SEVEN integer digits.
+    //
+    // Filled with '4' because Inter's figures are PROPORTIONAL by default and '4' is its widest
+    // digit (1323/2048 = 7.75px at 12px; '8' is only 1267/2048, '1' just 833/2048). The labels
+    // enable tabular figures, which makes every digit 7.78px and the fill digit moot — but '4'
+    // keeps the reserve a true bound anyway if a user picks a font that has no `tnum`.
+    readonly property string speedReserveText: displayUnit === "kbps" ? "4444444.4 KB/s"
+                                                                      : "4444.44 MB/s"
 
     function formatBytes(bytes) {
         if (bytes < 1024) return bytes.toFixed(0) + " B";
@@ -861,8 +883,25 @@ PluginComponent {
     // ── Horizontal Bar Pill (for horizontal DankBar) ──
     horizontalBarPill: Component {
         Row {
+            id: pillRow
             spacing: Theme.spacingS
             visible: true
+
+            // Reserved width shared by all three speed labels (they share one font), so the
+            // pill stops resizing as the digits change. Copying the whole `font` GROUP off a
+            // real label carries family, pixelSize, weight, hinting AND font.features across in
+            // one binding, and resolves the family through the very same path the Text does.
+            // Deliberately plain Qt TextMetrics, not DMS's StyledTextMetrics: that one
+            // re-resolves the family through a non-reactive Qt.fontFamilies() call and falls
+            // back to "DejaVu Sans" — and "Inter Variable" is not a system font, it exists only
+            // because StyledText's FontLoader registers it.
+            TextMetrics {
+                id: speedReserve
+                font: dlSpeedLabel.font
+                text: root.speedReserveText
+            }
+            // +1px absorbs TextMetrics (QFontMetricsF) vs NativeRendering hinted-advance drift
+            readonly property real speedReserveWidth: Math.ceil(speedReserve.width) + 1
 
             // ── Offline state: differentiate wifi_off vs disconnected ──
             DankIcon {
@@ -894,8 +933,13 @@ PluginComponent {
                 StyledText {
                     text: root.formatSpeed(root.totalSpeed)
                     font.pixelSize: Theme.fontSizeSmall
+                    font.features: ({ "tnum": 1 })
                     color: Theme.surfaceText
                     anchors.verticalCenter: parent.verticalCenter
+                    wrapMode: Text.NoWrap
+                    elide: Text.ElideNone
+                    horizontalAlignment: Text.AlignLeft
+                    width: Math.max(contentWidth, pillRow.speedReserveWidth)
                 }
             }
 
@@ -911,16 +955,33 @@ PluginComponent {
                     color: root.downloadSpeed > 0 ? Theme.primary : Theme.surfaceVariantText
                     anchors.verticalCenter: parent.verticalCenter
                     weight: 700
-                    
+
                     Behavior on color {
                         ColorAnimation { duration: 200; easing.type: Easing.OutCubic }
                     }
                 }
                 StyledText {
+                    // Also the font source for pillRow's speedReserve: this label is
+                    // instantiated in combined mode too, its ancestor Row is just hidden
+                    id: dlSpeedLabel
+
                     text: root.formatSpeed(root.downloadSpeed)
                     font.pixelSize: Theme.fontSizeSmall
+                    // Tabular figures: without them Inter renders '1' at 4.9px and '9' at
+                    // 7.4px, so the digits wobble inside the reserved box every poll
+                    font.features: ({ "tnum": 1 })
                     color: Theme.surfaceText
                     anchors.verticalCenter: parent.verticalCenter
+                    // NoWrap + ElideNone are load-bearing, not decoration: StyledText defaults
+                    // to WordWrap + ElideRight, and under either of those contentWidth is
+                    // measured against the item's own width — making the binding below a
+                    // feedback loop that either oscillates or paints a spurious ellipsis
+                    wrapMode: Text.NoWrap
+                    elide: Text.ElideNone
+                    // Left-aligned so the slack falls after the unit; right-aligning would open
+                    // a floating gap between the arrow and the digits it belongs to
+                    horizontalAlignment: Text.AlignLeft
+                    width: Math.max(contentWidth, pillRow.speedReserveWidth)
                 }
             }
 
@@ -936,7 +997,7 @@ PluginComponent {
                     color: root.uploadSpeed > 0 ? Theme.error : Theme.surfaceVariantText
                     anchors.verticalCenter: parent.verticalCenter
                     weight: 700
-                    
+
                     Behavior on color {
                         ColorAnimation { duration: 200; easing.type: Easing.OutCubic }
                     }
@@ -944,8 +1005,13 @@ PluginComponent {
                 StyledText {
                     text: root.formatSpeed(root.uploadSpeed)
                     font.pixelSize: Theme.fontSizeSmall
+                    font.features: ({ "tnum": 1 })
                     color: Theme.surfaceText
                     anchors.verticalCenter: parent.verticalCenter
+                    wrapMode: Text.NoWrap
+                    elide: Text.ElideNone
+                    horizontalAlignment: Text.AlignLeft
+                    width: Math.max(contentWidth, pillRow.speedReserveWidth)
                 }
             }
         }
