@@ -12,6 +12,11 @@ Column {
     // Wired up by the parent popout
     property bool active: false
     property var formatSpeedFn: null
+    // Width to reserve for a rate column, derived by the parent from formatSpeedFn's widest
+    // possible output (see NetworkIndicator's speedReserveWidth). Keeps the ↓/↑ columns aligned
+    // across rows — the job the old hard-coded 62 did, except 62 was narrower than the strings
+    // formatSpeedFn can actually emit, so fast transfers were silently eliding to "444.4 M…".
+    property real speedReserveWidth: 0
 
     // "starting" | "ok" | "missing" | "noperm"
     property string status: "starting"
@@ -238,9 +243,11 @@ Column {
                 StyledText {
                     text: section.formatSpeedFn ? section.formatSpeedFn(appRow.recv) : ""
                     font.pixelSize: Theme.fontSizeSmall
+                    font.features: ({ "tnum": 1 })
                     color: Theme.surfaceVariantText
                     wrapMode: Text.NoWrap
-                    width: 62
+                    elide: Text.ElideNone
+                    width: Math.max(contentWidth, section.speedReserveWidth)
                     horizontalAlignment: Text.AlignRight
                     anchors.verticalCenter: parent.verticalCenter
                 }
@@ -260,9 +267,11 @@ Column {
                 StyledText {
                     text: section.formatSpeedFn ? section.formatSpeedFn(appRow.sent) : ""
                     font.pixelSize: Theme.fontSizeSmall
+                    font.features: ({ "tnum": 1 })
                     color: Theme.surfaceVariantText
                     wrapMode: Text.NoWrap
-                    width: 62
+                    elide: Text.ElideNone
+                    width: Math.max(contentWidth, section.speedReserveWidth)
                     horizontalAlignment: Text.AlignRight
                     anchors.verticalCenter: parent.verticalCenter
                 }

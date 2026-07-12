@@ -97,7 +97,15 @@ PluginComponent {
     property var _cycleCounters: ({})    // per-cycle raw counters (iface → {rx, tx})
     property var _upIfaces: ({})         // per-cycle operstate lookup (iface → bool)
     property var _ssidByIface: ({})      // per-cycle SSID lookup (iface → ssid)
+    property var _cycleLinkMbit: ({})    // per-cycle link rate lookup (iface → Mb/s)
     property bool _lastPollFailed: false // last poll script exit status (for log throttling)
+
+    // Combined line rate of the tracked interfaces, in bytes/sec. This is the ceiling on any
+    // speed the widget can ever display (downloadSpeed sums the primaries), so it's what bounds
+    // the bar pill's reserved width — see speedReserveWidth. The kernel won't report a rate for
+    // every interface (wireless drivers and virtual devices commonly refuse), so unknowns fall
+    // back to the floor below rather than shrinking the reserve to nothing.
+    property real maxLinkBytesPerSec: fallbackLinkBytesPerSec
 
     // ── Persistent data usage tracking ──
     property var usageData: ({})        // full parsed JSON object
@@ -123,6 +131,9 @@ PluginComponent {
     readonly property int maxPopoutHeight: 680                   // cap when history is expanded
     readonly property int groupRowHeight: 28                     // height of one per-group usage row
     property real _perAppSectionH: 0                             // reported by the popout's PerAppSection
+    // Assumed line rate for interfaces whose rate the kernel won't report (wireless, virtual).
+    // A floor, not a cap: the width binding still grows past the reserve if a value overflows it.
+    readonly property real fallbackLinkBytesPerSec: 1000 * 1000 * 1000 / 8   // 1 GbE
 
     // ── Offline reason detection (uses DMS NetworkService) ──
     property bool _dmsNetworkAvailable: typeof DMSNetworkService !== "undefined" && DMSNetworkService.networkAvailable
@@ -147,29 +158,50 @@ PluginComponent {
         } else if (bytesPerSec < 1024 * 1024 * 1024) {
             return (bytesPerSec / (1024 * 1024)).toFixed(2) + " MB/s";
         }
-        // Without this branch a 10GbE link reads "1192.05 MB/s" — six digits, and
-        // wider than any reserve the bar pill can sanely hold (see speedReserveText)
+        // Without this branch a 10GbE link keeps counting in MB/s ("1192.05 MB/s") — hard to
+        // read, and the widest string the pill would ever have to reserve room for
         return (bytesPerSec / (1024 * 1024 * 1024)).toFixed(2) + " GB/s";
     }
 
-    // Widest string the bar pill can render, per unit mode. The pill reserves this width so it
-    // stops resizing on every poll. Must be a true UPPER BOUND on formatSpeed()'s output: the
-    // label's width binding takes Math.max(content, reserve), so the reserve is a floor, not a
-    // cap — under-reserve and the pill simply grows again, which is the bug.
+    // ── Reserved width for a speed readout ──────────────────────────────────────────────────
+    // The bar pill reserves this width so it stops resizing on every poll. It has to be a true
+    // UPPER BOUND on formatSpeed()'s output: the width binding is Math.max(content, reserve),
+    // so the reserve is a floor, not a cap — under-reserve and the pill just grows again.
     //
-    // Digit counts are bounded by the branch above, at 10GbE line rate (~1.25 GB/s):
-    //   auto/mbps: MB/s runs to "1024.00 MB/s" — FOUR integer digits, not three: the GB/s
-    //              handover is at 1024 MB/s, so 1000.00-1023.99 MB/s (8.4-8.6 Gbps) is
-    //              reachable. " MB/s" also beats " KB/s"/" B/s" at equal digit count
-    //              ('M' 10.84px > 'K' 8.06px), and GB/s ("1.25 GB/s") is far narrower.
-    //   kbps: never switches unit, so 10GbE reads "1220703.1 KB/s" — SEVEN integer digits.
-    //
-    // Filled with '4' because Inter's figures are PROPORTIONAL by default and '4' is its widest
-    // digit (1323/2048 = 7.75px at 12px; '8' is only 1267/2048, '1' just 833/2048). The labels
-    // enable tabular figures, which makes every digit 7.78px and the fill digit moot — but '4'
-    // keeps the reserve a true bound anyway if a user picks a font that has no `tnum`.
-    readonly property string speedReserveText: displayUnit === "kbps" ? "4444444.4 KB/s"
-                                                                      : "4444.44 MB/s"
+    // Rather than hard-coding a worst-case string (which silently stops being an upper bound the
+    // moment formatSpeed's units or decimals change), ask formatSpeed itself. Speed → width is
+    // NOT monotonic in auto mode, because switching up a unit makes the string shorter, so probe
+    // the top of every branch and measure whichever renders widest:
+    //   • the largest B/s, KB/s and MB/s each branch can emit before it hands over, and
+    //   • the interface line rate, which is where kbps/mbps top out (they never switch unit).
+    // Each probe is clamped to the line rate: a boundary the interface cannot reach is not a
+    // string it can render, and probing it anyway would inflate the reserve (a gigabit NIC would
+    // reserve room for "1048576.0 KB/s" it can never show). Clamping is what makes the reserve
+    // self-calibrate — a 1 GbE box reserves less than a 10GbE one.
+    readonly property var speedReserveProbes: {
+        var line = maxLinkBytesPerSec;
+        return [
+            Math.min(1024 - 1, line),                // widest B/s  ("1023 B/s")
+            Math.min(1024 * 1024 - 1, line),         // widest KB/s ("1024.0 KB/s")
+            Math.min(1024 * 1024 * 1024 - 1, line),  // widest MB/s ("1024.00 MB/s")
+            line                                     // line rate: where kbps/mbps top out
+        ];
+    }
+
+    readonly property real speedReserveWidth: Math.ceil(Math.max(reserveP0.contentWidth, reserveP1.contentWidth,
+                                                                 reserveP2.contentWidth, reserveP3.contentWidth))
+
+    // Measured with hidden StyledTexts — the same type, font and render path as the real labels —
+    // rather than a TextMetrics. TextMetrics measures via QFontMetricsF (unhinted, fractional
+    // advances) while StyledText paints with NativeRendering (hinted, integer advances); across a
+    // 14-glyph string those disagree by more than a pixel, which is enough for the "reserve" to
+    // come out NARROWER than the label it is supposed to cover. Measuring with the thing that
+    // renders removes the mismatch by construction. They never paint (visible: false) but still
+    // lay out, which is all contentWidth needs.
+    StyledText { id: reserveP0; visible: false; font.pixelSize: Theme.fontSizeSmall; font.features: ({ "tnum": 1 }); wrapMode: Text.NoWrap; elide: Text.ElideNone; text: root.formatSpeed(root.speedReserveProbes[0]) }
+    StyledText { id: reserveP1; visible: false; font.pixelSize: Theme.fontSizeSmall; font.features: ({ "tnum": 1 }); wrapMode: Text.NoWrap; elide: Text.ElideNone; text: root.formatSpeed(root.speedReserveProbes[1]) }
+    StyledText { id: reserveP2; visible: false; font.pixelSize: Theme.fontSizeSmall; font.features: ({ "tnum": 1 }); wrapMode: Text.NoWrap; elide: Text.ElideNone; text: root.formatSpeed(root.speedReserveProbes[2]) }
+    StyledText { id: reserveP3; visible: false; font.pixelSize: Theme.fontSizeSmall; font.features: ({ "tnum": 1 }); wrapMode: Text.NoWrap; elide: Text.ElideNone; text: root.formatSpeed(root.speedReserveProbes[3]) }
 
     function formatBytes(bytes) {
         if (bytes < 1024) return bytes.toFixed(0) + " B";
@@ -626,6 +658,7 @@ PluginComponent {
             root._cycleCounters = {};
             root._upIfaces = {};
             root._ssidByIface = {};
+            root._cycleLinkMbit = {};
             netProcess.running = true;
         }
     }
@@ -653,6 +686,10 @@ PluginComponent {
             "for f in /sys/class/net/*/operstate; do " +
             "  iface=$(basename $(dirname $f)); " +
             "  echo \"OPSTATE:${iface}:$(cat $f 2>/dev/null)\"; " +
+            // Link rate in Mb/s. Bounds the widest speed we can ever render, which is what sizes
+            // the bar pill. Reading it EINVALs on wireless/virtual devices, hence 2>/dev/null —
+            // those simply report nothing and fall back to fallbackLinkBytesPerSec.
+            "  echo \"LINK:${iface}:$(cat /sys/class/net/${iface}/speed 2>/dev/null)\"; " +
             "  if [ -d /sys/class/net/${iface}/wireless ]; then " +
             "    ssid=$(iwgetid -r ${iface} 2>/dev/null); " +
             "    if [ -z \"$ssid\" ] && command -v nmcli >/dev/null 2>&1; then " +
@@ -680,6 +717,17 @@ PluginComponent {
                     // Only "down" disqualifies — some drivers report "unknown"
                     // while passing traffic
                     root._upIfaces[oparts[1]] = (oparts[2] !== "down");
+                    return;
+                }
+
+                if (line.startsWith("LINK:")) {
+                    var lparts = line.split(":");
+                    // Empty (unreadable) or -1 (no carrier) both mean "unknown" — leave the
+                    // interface out so it falls back to fallbackLinkBytesPerSec
+                    var mbit = parseInt(lparts[2], 10);
+                    if (isFinite(mbit) && mbit > 0) {
+                        root._cycleLinkMbit[lparts[1]] = mbit;
+                    }
                     return;
                 }
 
@@ -807,6 +855,17 @@ PluginComponent {
             // Update interfaceFound ONLY after the full read completes (no flicker)
             root.interfaceFound = anyPrimary;
 
+            // The displayed speed is the SUM over the primaries, so the sum of their line rates
+            // is its ceiling — and therefore what the pill's reserved width has to cover. Any
+            // primary whose rate the kernel wouldn't report contributes the fallback instead.
+            var linkBps = 0;
+            for (var p = 0; p < all.length; p++) {
+                if (!root.isPrimaryIface(all[p])) continue;
+                var mbit = root._cycleLinkMbit[all[p]];
+                linkBps += (mbit > 0) ? (mbit * 1000 * 1000 / 8) : root.fallbackLinkBytesPerSec;
+            }
+            root.maxLinkBytesPerSec = Math.max(linkBps, root.fallbackLinkBytesPerSec);
+
             root.downloadSpeed = anyPrimary ? speedRx / elapsedSec : 0;
             root.uploadSpeed = anyPrimary ? speedTx / elapsedSec : 0;
 
@@ -883,25 +942,8 @@ PluginComponent {
     // ── Horizontal Bar Pill (for horizontal DankBar) ──
     horizontalBarPill: Component {
         Row {
-            id: pillRow
             spacing: Theme.spacingS
             visible: true
-
-            // Reserved width shared by all three speed labels (they share one font), so the
-            // pill stops resizing as the digits change. Copying the whole `font` GROUP off a
-            // real label carries family, pixelSize, weight, hinting AND font.features across in
-            // one binding, and resolves the family through the very same path the Text does.
-            // Deliberately plain Qt TextMetrics, not DMS's StyledTextMetrics: that one
-            // re-resolves the family through a non-reactive Qt.fontFamilies() call and falls
-            // back to "DejaVu Sans" — and "Inter Variable" is not a system font, it exists only
-            // because StyledText's FontLoader registers it.
-            TextMetrics {
-                id: speedReserve
-                font: dlSpeedLabel.font
-                text: root.speedReserveText
-            }
-            // +1px absorbs TextMetrics (QFontMetricsF) vs NativeRendering hinted-advance drift
-            readonly property real speedReserveWidth: Math.ceil(speedReserve.width) + 1
 
             // ── Offline state: differentiate wifi_off vs disconnected ──
             DankIcon {
@@ -939,7 +981,7 @@ PluginComponent {
                     wrapMode: Text.NoWrap
                     elide: Text.ElideNone
                     horizontalAlignment: Text.AlignLeft
-                    width: Math.max(contentWidth, pillRow.speedReserveWidth)
+                    width: Math.max(contentWidth, root.speedReserveWidth)
                 }
             }
 
@@ -961,10 +1003,6 @@ PluginComponent {
                     }
                 }
                 StyledText {
-                    // Also the font source for pillRow's speedReserve: this label is
-                    // instantiated in combined mode too, its ancestor Row is just hidden
-                    id: dlSpeedLabel
-
                     text: root.formatSpeed(root.downloadSpeed)
                     font.pixelSize: Theme.fontSizeSmall
                     // Tabular figures: without them Inter renders '1' at 4.9px and '9' at
@@ -981,7 +1019,7 @@ PluginComponent {
                     // Left-aligned so the slack falls after the unit; right-aligning would open
                     // a floating gap between the arrow and the digits it belongs to
                     horizontalAlignment: Text.AlignLeft
-                    width: Math.max(contentWidth, pillRow.speedReserveWidth)
+                    width: Math.max(contentWidth, root.speedReserveWidth)
                 }
             }
 
@@ -1011,7 +1049,7 @@ PluginComponent {
                     wrapMode: Text.NoWrap
                     elide: Text.ElideNone
                     horizontalAlignment: Text.AlignLeft
-                    width: Math.max(contentWidth, pillRow.speedReserveWidth)
+                    width: Math.max(contentWidth, root.speedReserveWidth)
                 }
             }
         }
@@ -1429,6 +1467,7 @@ PluginComponent {
                         visible: root.perAppTraffic
                         active: popoutColumn.visible && root.perAppTraffic
                         formatSpeedFn: root.formatSpeed
+                        speedReserveWidth: root.speedReserveWidth
                         onSectionHeightChanged: {
                             root._perAppSectionH = sectionHeight;
                             root.updatePopoutHeight();
